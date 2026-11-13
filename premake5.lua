@@ -803,6 +803,20 @@ project "MicrobenchmarksCuda"
     includedirs {"Source"}
     defines {"KTT_CUDA_EXAMPLE"}
     links {"ktt"}
+
+project "EnergyProbesCuda"
+    kind "ConsoleApp"
+    files {"Examples/EnergyProbes/*.cpp", "Examples/EnergyProbes/*.cu"}
+    includedirs {"Source", "Libraries/Json-3.9.1", "$(CUDA_PATH)/include"}
+    libdirs {"$(CUDA_PATH)/lib64", "$(CUDA_PATH)/lib64/stubs"}
+    defines {"KTT_CUDA_EXAMPLE"}
+    -- NVML and the CUDA driver are used directly for clock locking, traces and the energy counter
+    links {"ktt", "nvidia-ml", "cuda"}
+    -- The NVML trace runs on its own thread; glibc older than 2.34 keeps pthread in a separate library
+    filter "system:linux"
+        buildoptions {"-pthread"}
+        linkoptions {"-pthread"}
+    filter {}
 end -- cudaProjects
 
 if cppProjects then
