@@ -16,6 +16,13 @@
 #define MIX_CHAINS 4
 #define MIX_GROUP 64
 
+// MIX_OP 0: the FFMAs above. MIX_OP 1 (--mixed-int, NEXT_STEPS_PLAN M2): address-like integer instructions instead, an add,
+// a shift and an and in turn (IADD3, SHF, LOP3), the same count per group; with them the memory probes have the
+// L1/L2 events in other proportions to "inst alu" and "inst fma", as Delestrac et al. cross-check their calibration.
+#ifndef MIX_OP
+#define MIX_OP 0
+#endif
+
 extern "C" __global__ void probeMixed(Element* __restrict__ data, u32* __restrict__ sink, u64* __restrict__ counts,
     u32* __restrict__ smCounters, const u32 gridSplit, const u32 activeSms, const u32 idleRatio, const u32 operandC,
     const u32 fmaGroups, const u64 durationNs)
@@ -49,6 +56,15 @@ extern "C" __global__ void probeMixed(Element* __restrict__ data, u32* __restric
     u32 index = (startRow * BLOCK_SIZE + threadIdx.x) & mask;
 
     const u32 seed = (blockIdx.x * BLOCK_SIZE + threadIdx.x) * 16u;
+#if MIX_OP == 1
+    u32 value[MIX_CHAINS];
+    const u32 c = operandC | 1u;
+
+    for (int i = 0; i < MIX_CHAINS; ++i)
+    {
+        value[i] = mix(seed + i);
+    }
+#else
     const float c = __uint_as_float(operandC);
     float value[MIX_CHAINS];
 
@@ -56,6 +72,7 @@ extern "C" __global__ void probeMixed(Element* __restrict__ data, u32* __restric
     {
         value[i] = __uint_as_float(0x3f800000u | (mix(seed + i) >> 10));
     }
+#endif
 
     u32 accumulator = 0;
     u64 iterations = 0;
@@ -85,7 +102,22 @@ extern "C" __global__ void probeMixed(Element* __restrict__ data, u32* __restric
                 #pragma unroll
                 for (int i = 0; i < MIX_CHAINS; ++i)
                 {
+#if MIX_OP == 1
+                    if ((step * MIX_CHAINS + i) % 3 == 0)
+                    {
+                        asm volatile("add.u32 %0, %0, %1;" : "+r"(value[i]) : "r"(c));
+                    }
+                    else if ((step * MIX_CHAINS + i) % 3 == 1)
+                    {
+                        asm volatile("shf.l.wrap.b32 %0, %0, %0, 3;" : "+r"(value[i]));
+                    }
+                    else
+                    {
+                        asm volatile("and.b32 %0, %0, %1;" : "+r"(value[i]) : "r"(c | 0x0f0f0f0fu));
+                    }
+#else
                     value[i] = fmaf(value[i], value[i], c);
+#endif
                 }
             }
         }
@@ -101,7 +133,11 @@ extern "C" __global__ void probeMixed(Element* __restrict__ data, u32* __restric
 
     for (int i = 0; i < MIX_CHAINS; ++i)
     {
+#if MIX_OP == 1
+        result ^= value[i];
+#else
         result ^= __float_as_uint(value[i]);
+#endif
     }
 
     sink[blockIdx.x * BLOCK_SIZE + threadIdx.x] = result;

@@ -7,10 +7,21 @@
 // and guarded moves, as in the Coulomb example), 9 = FFMA with three different register operands (see below);
 // instruction classes that the operations above do not cover: 10 = SHFL (shfl.sync.bfly), 11 = BAR (bar.sync),
 // 12 = the FFMA chain in a loop that is not unrolled (a branch and its compare per 4 FFMAs), 13 = x * x + c as a separate
-// FMUL and FADD, 14 = MUFU.SIN (x -> sin(a * x + c)).
+// FMUL and FADD, 14 = MUFU.SIN (x -> sin(a * x + c));
+// partially active warps (--lanes, 2026-11-13): 15 = FFMA, 16 = FFMA in a branch, 17 = IADD, 18 = IADD in a branch, each
+// with LANES of the 32 lanes active (15 and 17: a guard predicate on every instruction; 16 and 18: the other lanes skip
+// the loop body in a branch, as a divergent warp does);
+// instruction classes inside one event (--instr-classes, 2026-11-13): 19 = LOP3 (xor), 20 = SHF (rotate by a variable
+// amount), 21 = IMNMX followed by LOP3 (min, then xor), all chained around the four integer registers; 22 = FADD alone
+// (x -> c - x), 23 = FMUL alone (x -> x * k, then x * (1 / k)); 24-28 = MUFU RCP, SQRT, EX2, LG2 and RSQ, each fed by
+// the FFMA recurrence of COMPUTE_OP 1 and added into an accumulator (one FFMA, one MUFU and one FADD per step).
 
 #ifndef COMPUTE_OP
 #define COMPUTE_OP 1
+#endif
+
+#ifndef LANES
+#define LANES 32
 #endif
 
 // The registers per thread of the mma.sync operands (A and B hold two f16 each, D four or eight f32): m16n8k16 from sm_80,
@@ -208,6 +219,73 @@ extern "C" __global__ void probeCompute(u32* __restrict__ sink, u64* __restrict_
     {
         value[i] = __uint_as_float((0x3f800000u | (mix(seed + i) >> 10)) & payloadMask);
     }
+#elif COMPUTE_OP == 15 || COMPUTE_OP == 16 || COMPUTE_OP == 34
+    // The FFMA recurrence of COMPUTE_OP 1, in LANES lanes of each warp. COMPUTE_OP 34 (NEXT_STEPS_PLAN M5): the LANES
+    // active lanes rotate from one unrolled step to the next (lanes (lane + 5 u) mod 32 < LANES), so that no lane is on
+    // in every instruction, as when lanes are switched off lane by lane.
+    float value[COMPUTE_CHAINS];
+    const float c = __uint_as_float(operandC);
+    // Opaque: with LANES 0 the compiler would remove the guarded instructions; they stay (issued, no lane on).
+    const u32 active = (threadIdx.x & 31u) < Opaque(LANES) ? 1u : 0u;
+#if COMPUTE_OP == 34
+    u32 rotating[UNROLL];
+
+    for (int u = 0; u < UNROLL; ++u)
+    {
+        rotating[u] = ((threadIdx.x + 5u * static_cast<u32>(u)) & 31u) < Opaque(LANES) ? 1u : 0u;
+    }
+#endif
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = __uint_as_float((0x3f800000u | (mix(seed + i) >> 10)) & payloadMask);
+    }
+#elif COMPUTE_OP == 17 || COMPUTE_OP == 18
+    // Integer additions a_i += a_(i+1) around the four chains (each add depends on the previous one of its chain, so ptxas
+    // cannot merge them), in LANES lanes of each warp.
+    u32 value[COMPUTE_CHAINS];
+    // Opaque: with LANES 0 the compiler would remove the guarded instructions; they stay (issued, no lane on).
+    const u32 active = (threadIdx.x & 31u) < Opaque(LANES) ? 1u : 0u;
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = mix(seed + i) & payloadMask;
+    }
+#elif (COMPUTE_OP >= 19 && COMPUTE_OP <= 21) || COMPUTE_OP == 29 || COMPUTE_OP == 31 \
+    || COMPUTE_OP == 33
+    u32 value[COMPUTE_CHAINS];
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = mix(seed + i) & payloadMask;
+    }
+#elif COMPUTE_OP == 30 || COMPUTE_OP == 32
+    float value[COMPUTE_CHAINS];
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = __uint_as_float((0x3f800000u | (mix(seed + i) >> 10)) & payloadMask);
+    }
+#elif COMPUTE_OP == 22 || COMPUTE_OP == 23
+    // FADD: c = 1.9 (the host's operandC); FMUL: k = operandA, 1 / k = operandC.
+    float value[COMPUTE_CHAINS];
+    const float a = __uint_as_float(operandA);
+    const float c = __uint_as_float(operandC);
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = __uint_as_float((0x3f800000u | (mix(seed + i) >> 10)) & payloadMask);
+    }
+#elif COMPUTE_OP >= 24 && COMPUTE_OP <= 28
+    float value[COMPUTE_CHAINS];
+    float sum[COMPUTE_CHAINS];
+    const float c = __uint_as_float(operandC);
+
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        value[i] = __uint_as_float((0x3f800000u | (mix(seed + i) >> 10)) & payloadMask);
+        sum[i] = 0.0f;
+    }
 #elif COMPUTE_OP == 7 || COMPUTE_OP == 8
     float value[INDEXED_VALUES];
     const float c = __uint_as_float(operandC);
@@ -247,6 +325,24 @@ extern "C" __global__ void probeCompute(u32* __restrict__ sink, u64* __restrict_
         for (int j = 0; j < INDEXED_VALUES; ++j)
         {
             value[j] = fmaf(value[j], value[j], c);
+        }
+#elif COMPUTE_OP == 16 || COMPUTE_OP == 18
+        // The inactive lanes branch around the whole body (a divergent warp).
+        if (active != 0u)
+        {
+            #pragma unroll
+            for (int u = 0; u < UNROLL; ++u)
+            {
+                #pragma unroll
+                for (int i = 0; i < COMPUTE_CHAINS; ++i)
+                {
+#if COMPUTE_OP == 16
+                    asm volatile("fma.rn.f32 %0, %0, %0, %1;" : "+f"(value[i]) : "f"(c));
+#else
+                    asm volatile("add.u32 %0, %0, %1;" : "+r"(value[i]) : "r"(value[(i + 1) % COMPUTE_CHAINS]));
+#endif
+                }
+            }
         }
 #elif COMPUTE_OP == 12
         #pragma unroll 1
@@ -303,6 +399,66 @@ extern "C" __global__ void probeCompute(u32* __restrict__ sink, u64* __restrict_
                 value[i] = __fadd_rn(__fmul_rn(value[i], value[i]), c);
 #elif COMPUTE_OP == 14
                 value[i] = __sinf(fmaf(value[i], a, c));
+#elif COMPUTE_OP == 19
+                asm volatile("xor.b32 %0, %0, %1;" : "+r"(value[i]) : "r"(value[(i + 1) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 20
+                asm volatile("shf.l.wrap.b32 %0, %0, %0, %1;" : "+r"(value[i]) : "r"(value[(i + 1) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 21
+                asm volatile("min.u32 %0, %0, %1;\n\txor.b32 %0, %0, %2;" : "+r"(value[i])
+                    : "r"(value[(i + 1) % COMPUTE_CHAINS]), "r"(value[(i + 2) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 29
+                // Integer compare and select: ISETP + SEL.
+                asm volatile("{\n\t.reg .pred p;\n\tsetp.lt.u32 p, %0, %1;\n\tselp.b32 %0, %1, %2, p;\n\t}"
+                    : "+r"(value[i]) : "r"(value[(i + 1) % COMPUTE_CHAINS]), "r"(value[(i + 2) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 30
+                // Float compare and select: FSETP + FSEL.
+                asm volatile("{\n\t.reg .pred p;\n\tsetp.lt.f32 p, %0, %1;\n\tselp.f32 %0, %1, %2, p;\n\t}"
+                    : "+f"(value[i]) : "f"(value[(i + 1) % COMPUTE_CHAINS]), "f"(value[(i + 2) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 31
+                // Conversions: integer to float, an FADD (ptxas folds the two conversions without it), back to integer.
+                {
+                    float converted;
+                    asm volatile("cvt.rn.f32.u32 %0, %1;" : "=f"(converted) : "r"(value[i]));
+                    asm volatile("add.rn.f32 %0, %0, 0f3F000000;" : "+f"(converted));
+                    asm volatile("cvt.rzi.u32.f32 %0, %1;" : "=r"(value[i]) : "f"(converted));
+                }
+#elif COMPUTE_OP == 32
+                // Float min and max (FMNMX).
+                asm volatile("min.f32 %0, %0, %1;\n\tmax.f32 %0, %0, %2;" : "+f"(value[i])
+                    : "f"(value[(i + 1) % COMPUTE_CHAINS]), "f"(value[(i + 2) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 33
+                // Three-input integer add (ptxas merges the two adds into one IADD3).
+                asm volatile("add.u32 %0, %0, %1;\n\tadd.u32 %0, %0, %2;" : "+r"(value[i])
+                    : "r"(value[(i + 1) % COMPUTE_CHAINS]), "r"(value[(i + 2) % COMPUTE_CHAINS]));
+#elif COMPUTE_OP == 22
+                asm volatile("sub.rn.f32 %0, %1, %0;" : "+f"(value[i]) : "f"(c));
+#elif COMPUTE_OP == 23
+                asm volatile("mul.rn.f32 %0, %0, %1;" : "+f"(value[i]) : "f"(u % 2 == 0 ? a : c));
+#elif COMPUTE_OP >= 24 && COMPUTE_OP <= 28
+                float special;
+                asm volatile("fma.rn.f32 %0, %0, %0, %1;" : "+f"(value[i]) : "f"(c));
+#if COMPUTE_OP == 24
+                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(special) : "f"(value[i]));
+#elif COMPUTE_OP == 25
+                asm volatile("sqrt.approx.ftz.f32 %0, %1;" : "=f"(special) : "f"(fabsf(value[i])));
+#elif COMPUTE_OP == 26
+                asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(special) : "f"(value[i]));
+#elif COMPUTE_OP == 27
+                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(special) : "f"(fabsf(value[i])));
+#else
+                asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(special) : "f"(fabsf(value[i])));
+#endif
+                asm volatile("add.rn.f32 %0, %0, %1;" : "+f"(sum[i]) : "f"(special));
+#elif COMPUTE_OP == 34
+                asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.u32 p, %2, 0;\n\t@p fma.rn.f32 %0, %0, %0, %1;\n\t}"
+                    : "+f"(value[i]) : "f"(c), "r"(rotating[u]));
+#elif COMPUTE_OP == 15
+                // A guard predicate on the instruction: the warp issues it, LANES lanes execute it.
+                asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.u32 p, %2, 0;\n\t@p fma.rn.f32 %0, %0, %0, %1;\n\t}"
+                    : "+f"(value[i]) : "f"(c), "r"(active));
+#elif COMPUTE_OP == 17
+                asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.u32 p, %2, 0;\n\t@p add.u32 %0, %0, %1;\n\t}"
+                    : "+r"(value[i]) : "r"(value[(i + 1) % COMPUTE_CHAINS]), "r"(active));
 #elif COMPUTE_OP == 9
                 // One step updates all four copies (from their old values) at i == 0: four FFMAs, as four chains.
                 if (i == 0)
@@ -333,7 +489,25 @@ extern "C" __global__ void probeCompute(u32* __restrict__ sink, u64* __restrict_
 
     u32 result = 0;
 
-#if COMPUTE_OP == 1 || COMPUTE_OP == 6 || COMPUTE_OP == 12 || COMPUTE_OP == 13 || COMPUTE_OP == 14
+#if COMPUTE_OP == 1 || COMPUTE_OP == 6 || COMPUTE_OP == 12 || COMPUTE_OP == 13 || COMPUTE_OP == 14 || COMPUTE_OP == 15 \
+    || COMPUTE_OP == 34 \
+    || COMPUTE_OP == 16 || COMPUTE_OP == 22 || COMPUTE_OP == 23
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        result ^= __float_as_uint(value[i]);
+    }
+#elif COMPUTE_OP >= 24 && COMPUTE_OP <= 28
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        result ^= __float_as_uint(value[i]) ^ __float_as_uint(sum[i]);
+    }
+#elif (COMPUTE_OP >= 19 && COMPUTE_OP <= 21) || COMPUTE_OP == 29 || COMPUTE_OP == 31 \
+    || COMPUTE_OP == 33
+    for (int i = 0; i < COMPUTE_CHAINS; ++i)
+    {
+        result ^= value[i];
+    }
+#elif COMPUTE_OP == 30 || COMPUTE_OP == 32
     for (int i = 0; i < COMPUTE_CHAINS; ++i)
     {
         result ^= __float_as_uint(value[i]);
@@ -343,7 +517,7 @@ extern "C" __global__ void probeCompute(u32* __restrict__ sink, u64* __restrict_
     {
         result ^= static_cast<u32>(__double_as_longlong(value[i]));
     }
-#elif COMPUTE_OP == 3 || COMPUTE_OP == 4 || COMPUTE_OP == 10
+#elif COMPUTE_OP == 3 || COMPUTE_OP == 4 || COMPUTE_OP == 10 || COMPUTE_OP == 17 || COMPUTE_OP == 18
     for (int i = 0; i < COMPUTE_CHAINS; ++i)
     {
         result ^= value[i];

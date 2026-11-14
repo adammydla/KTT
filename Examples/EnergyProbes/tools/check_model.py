@@ -10,14 +10,19 @@ calibration run measured for the same probes:
     python3 tools/check_model.py --model rtx3090_1200mhz.model.json --run Quick
 
 It compares, per probe: the time per access (the clock and the memory behave as in the calibration), and the energy per
-access at full rate. It also compares the baseline power. The verdict:
+access at full rate. It also compares the baseline power at the run's temperature (40-60 % of a kernel's energy is the
+baseline). With --counters, the event counts per access of a short profiled run (--quick --profile) are compared with the
+calibration's, which shows a driver or GPU that counts differently. The verdict:
 
-  PASS      times within 3 %, energies: median within 5 %, 80 % of the probes within 10 %. Use the model as it is.
+  PASS      times within 3 %, energies: median within 5 %, 80 % of the probes within 10 %, the baseline within 3 %, and
+            (with --counters) the counts as in the calibration. Use the model as it is.
+  BASELINE  as PASS, but the baseline differs by more than 3 % (on the second RTX 3090 its slope over temperature was 0.73
+            instead of 0.28 W/C): --write FILE writes a model with this GPU's baseline.
   SCALED    times agree, the energies are off by a common factor (their spread around the median is small). The model's
             ranking holds, its absolute energies need the factor; --write FILE writes a model with the factor and this
             GPU's baseline applied.
-  FAIL      times differ (another clock or memory configuration), or the energies differ probe by probe. Calibrate this
-            GPU (README: Porting to another GPU).
+  FAIL      times differ (another clock or memory configuration), the energies differ probe by probe, or the counts
+            differ. Calibrate this GPU (docs/CALIBRATION.md: Porting to another GPU).
 
 Only probes that the run measured at a clock matching its own baseline count; with rows withheld for that reason the
 GPU's clock is not constant (not locked, or throttled), and a check at full rate cannot tell how the model does there.
@@ -33,6 +38,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import counter_table  # noqa: E402
+import energy_events  # noqa: E402
 import energy_predictor  # noqa: E402
 
 number = counter_table.number
@@ -46,6 +52,14 @@ SCALE_SPREAD = 0.05
 # Probes this close to the baseline are too noisy for a 5 s window (W above the baseline in the calibration).
 MIN_DYNAMIC_W = 10.0
 MIN_PROBES = 8
+# The baseline at the run's temperature against the model's (Quick0 on the second RTX 3090: +0.3 %).
+BASELINE_TOLERANCE = 0.03
+# Counts: a probe differs when its events, priced with the model, move its energy by more than this; the check fails when
+# a probe moves by more than COUNT_FAIL or more than COUNT_SHARE of the probes differ. Profiled counts of the same probe
+# agree within 0.5 % between runs on one GPU.
+COUNT_TOLERANCE = 0.05
+COUNT_FAIL = 0.10
+COUNT_SHARE = 0.10
 
 
 def compare(model, rows, use_withheld=False):
@@ -78,6 +92,33 @@ def compare(model, rows, use_withheld=False):
     return found, withheld
 
 
+def compare_counts(model, rows):
+    """(label, relative change of the probe's model energy, the event that moves it most) per probe that the profiled run
+    and the model file both have. Model files from before 2026-11-13 have no counts: None."""
+    reference = {p["label"]: p["counts"] for p in model.data["probes"] if p.get("counts")}
+    if not reference:
+        return None
+    found = []
+    for row in rows:
+        if row["payload"] != "random" or row["active_sms"] != "all" or row["duty_pct"] != "100" \
+                or not row.get("smsp__inst_executed.sum"):
+            continue
+        label = f"{row['level']} {row['operation']}" + (f" w{int(row['width_bytes'])}" if int(row["width_bytes"]) else "")
+        accesses = number(row["accesses_per_launch"])
+        if label not in reference or not accesses > 0:
+            continue
+        counts = {name: value / accesses for name, value in energy_events.events(row).items()}
+        expected = reference[label]
+        energy = sum(expected.get(name, 0.0) * model.pj.get(name, 0.0) for name in expected)
+        if not energy > 0:
+            continue
+        moves = {name: (counts.get(name, 0.0) - expected.get(name, 0.0)) * model.pj.get(name, 0.0) / energy
+                 for name in set(counts) | set(expected) if name != "DRAM busy ns"}
+        worst = max(moves, key=lambda name: abs(moves[name]))
+        found.append((label, sum(moves.values()), worst, sum(abs(v) for v in moves.values())))
+    return found
+
+
 def run_baseline(rows):
     """Mean power and temperature of the run's sleep rows."""
     sleeps = [(number(r["power_w"]), number(r["temperature_c"])) for r in rows
@@ -93,6 +134,8 @@ def main():
     parser.add_argument("--run", required=True, help="prefix of the short probe run on this GPU (its .csv)")
     parser.add_argument("--write", help="with the verdict SCALED (or PASS): write a model with the energies times the "
                         "common factor and this run's baseline")
+    parser.add_argument("--counters", help="prefix of a short profiled run on this GPU (--quick --profile): compare its "
+                        "event counts per access with the calibration's")
     parser.add_argument("--use-withheld", action="store_true",
                         help="also compare probes whose clock differed from the run's baseline (to look at an unlocked "
                              "GPU; their energies are biased by the baseline's clock, so no verdict follows)")
@@ -135,19 +178,46 @@ def main():
         print(f"  baseline: {base_w:.1f} W at {base_t:.1f} C, the model expects {expected:.1f} W "
               f"({100 * (base_w / expected - 1):+.1f} %)")
 
+    counts_ok = True
+    if arguments.counters:
+        compared = compare_counts(model, counter_table.read_rows(arguments.counters + ".csv"))
+        if compared is None:
+            print("  counts: the model file has no counts per probe (rebuild it with tools/build_model.py)")
+        elif not compared:
+            print(f"  counts: no probe of {arguments.counters} is in the model file")
+            counts_ok = False
+        else:
+            off = [c for c in compared if c[3] > COUNT_TOLERANCE]
+            bad = [c for c in compared if c[3] > COUNT_FAIL]
+            counts_ok = not bad and len(off) <= COUNT_SHARE * len(compared)
+            print(f"  counts: {len(compared)} probes compared, {len(off)} move their model energy by more than "
+                  f"{100 * COUNT_TOLERANCE:.0f} %" + (" (" + ", ".join(f"{c[0]} {100 * c[3]:.0f} % ({c[2]})"
+                                                                         for c in sorted(off, key=lambda c: -c[3])[:4])
+                                                       + ")" if off else ""))
+    baseline_ok = math.isnan(base_w) or abs(base_w / expected - 1) <= BASELINE_TOLERANCE
+
     if arguments.use_withheld:
         print("No verdict with --use-withheld: the energies above include rows at another clock than their baseline.")
         return 0
     if len(slow) > 0.2 * len(found):
         verdict = "FAIL"
         print("FAIL: the probes run at another speed than in the calibration (another clock or memory configuration).")
-    elif abs(median - 1) <= MEDIAN_TOLERANCE and within >= PROBE_SHARE:
+    elif not counts_ok:
+        verdict = "FAIL"
+        print("FAIL: the event counts differ from the calibration's (another GPU or driver counts differently); "
+              "calibrate this GPU.")
+    elif abs(median - 1) <= MEDIAN_TOLERANCE and within >= PROBE_SHARE and baseline_ok:
         verdict = "PASS"
         print("PASS: the model fits this GPU.")
+    elif abs(median - 1) <= MEDIAN_TOLERANCE and within >= PROBE_SHARE:
+        verdict = "BASELINE"
+        print(f"BASELINE: the energies fit, the baseline differs by {100 * (base_w / expected - 1):+.1f} % "
+              f"(more than {100 * BASELINE_TOLERANCE:.0f} %); --write takes this GPU's baseline.")
     elif spread <= SCALE_SPREAD:
         verdict = "SCALED"
         print(f"SCALED: the energies differ by a common factor of {median:.3f}; the model ranks configurations as "
-              "before, absolute energies need the factor (--write).")
+              "before, absolute energies need the factor (--write)."
+              + ("" if baseline_ok else f" The baseline differs by {100 * (base_w / expected - 1):+.1f} % too."))
     else:
         verdict = "FAIL"
         print("FAIL: the energies differ probe by probe; calibrate this GPU.")

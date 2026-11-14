@@ -1,5 +1,11 @@
 // Sub-sector accesses (probePartial). Parameters LOAD_OP (0 or 5) and WIDTH (4 or 8) as in Global.cu; the footprint and
-// the placement of the sectors are runtime arguments.
+// the placement of the sectors are runtime arguments. PARTIAL_WORDS (--write-path, 2026-11-13): the words a thread
+// accesses in each of its sectors before it moves on (default all, 32 / WIDTH; fewer leave the rest of the sector
+// untouched, as a partial write of a sector).
+
+#ifndef PARTIAL_WORDS
+#define PARTIAL_WORDS (32 / WIDTH)
+#endif
 
 // Sub-sector accesses (LOAD_OP 5 = st, any other value ld; WIDTH 4 or 8 bytes): every thread walks a 32-byte sector of
 // its own, one WIDTH-byte word per step, and moves to its next sector after the last word. A warp instruction thus
@@ -58,7 +64,7 @@ extern "C" __global__ void probePartial(Element* __restrict__ data, u32* __restr
             counter += threads;
 
             #pragma unroll
-            for (int u = 0; u < static_cast<int>(wordsPerSector); ++u)
+            for (int u = 0; u < static_cast<int>(PARTIAL_WORDS); ++u)
             {
                 Element* const address = sectorData + u;
 #if LOAD_OP == 5
@@ -76,7 +82,7 @@ extern "C" __global__ void probePartial(Element* __restrict__ data, u32* __restr
             }
         }
 
-        iterations += sectorsPerIteration * wordsPerSector;
+        iterations += sectorsPerIteration * PARTIAL_WORDS;
         now = globalTimer();
         IdleForDuty(idleRatio, burstIterations, burstStart, now);
     }

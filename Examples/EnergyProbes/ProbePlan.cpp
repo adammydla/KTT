@@ -350,6 +350,12 @@ void DescribeSetup(const Hardware& hardware, const Options& options, const Footp
             << FormatBytes(footprints.dram) << "\n";
     }
 
+    if (options.mixedInt)
+    {
+        std::cout << "  loads with integer work (16-byte ld with 0/4/8/16 add, shift, and per load) on random data at duty "
+            << "100: " << FormatBytes(footprints.l1) << ", " << FormatBytes(footprints.l2) << "\n";
+    }
+
     if (options.writes)
     {
         std::cout << "  write probes (copy, update in place: " << FormatBytes(footprints.l2) << ", "
@@ -369,9 +375,37 @@ void DescribeSetup(const Hardware& hardware, const Options& options, const Footp
     std::cout << "  order: sleep baseline, then for each duty: global" << (options.compute ? " and arithmetic" : "")
         << " probes + sleep baseline, then shared" << (options.latency ? ", latency" : "") << (options.bankConflicts ? ", bank conflicts" : "") << (options.constant ? ", constant" : "") << (options.texture ? ", texture" : "")
         << (options.dramLocality ? ", DRAM locality" : "") << (options.subSector ? ", sub-sector" : "")
-        << (options.indexing ? ", indexing" : "") << (options.mixed ? ", mixed intensity" : "")
+        << (options.indexing ? ", indexing" : "") << (options.lanes ? ", lanes" : "")
+        << (options.misaligned ? ", misaligned" : "") << (options.writePath ? ", write path" : "")
+        << (options.instrClasses ? ", instruction classes" : "")
+        << (options.mixed ? ", mixed intensity" : "")
         << (options.writes ? ", writes" : "") << (options.payloadBits.empty() ? "" : ", payload-bit loads, operands")
         << ", each followed by a sleep baseline, with the spin reference (heavy instruction issue) before the last\n";
+
+    if (options.l1Sweep)
+    {
+        std::cout << "  L1 sweep: ld and st at " << FormatBytes(footprints.l1) << " with 1-32 sectors in 1/4/32 lines per warp "
+            << "instruction (7 patterns), 4- and 16-byte words, at duty " << JoinList(options.duties, "/") << " %\n";
+    }
+
+    if (options.writePath)
+    {
+        std::cout << "  write path: 4-byte ld and st of 1/2/4/8 words per sector, 4/2/1 sectors per L2 request, at "
+            << FormatBytes(footprints.l2) << " and " << FormatBytes(footprints.dram) << ", at duty "
+            << JoinList(options.duties, "/") << " %\n";
+    }
+
+    if (options.misaligned)
+    {
+        std::cout << "  misaligned: 4- and 16-byte stream ld at " << FormatBytes(footprints.l1) << ", " << FormatBytes(footprints.l2)
+            << ", " << FormatBytes(footprints.dram) << " and st at the last two, started 16/32/64/96 bytes off the line, at duty " << JoinList(options.duties, "/") << " %\n";
+    }
+
+    if (options.lanes)
+    {
+        std::cout << "  lanes: FFMA and IADD with " << JoinList(LaneCounts, "/") << " of 32 lanes active (guard predicate, "
+            << "branch), at duty " << JoinList(options.duties, "/") << " %\n";
+    }
 
     if (!options.payloadBits.empty())
     {
@@ -412,12 +446,15 @@ void DescribeSetup(const Hardware& hardware, const Options& options, const Footp
     // in ProbeRun.cpp).
     const size_t groups = 1 + (options.bankConflicts ? 1 : 0) + (options.constant ? 1 : 0) + (options.texture ? 1 : 0)
         + (options.dramLocality ? 1 : 0) + (options.subSector ? 1 : 0) + (options.indexing ? 1 : 0)
-        + (options.mixed ? 1 : 0) + (options.writes ? 1 : 0) + (options.latency ? 1 : 0)
+        + (options.lanes ? 1 : 0) + (options.misaligned ? 1 : 0) + (options.writePath ? 1 : 0)
+        + (options.instrClasses ? 1 : 0) + (options.mixed || options.mixedInt ? 1 : 0) + (options.writes ? 1 : 0)
+        + (options.l1Sweep ? 1 : 0)
+        + (options.latency ? 1 : 0)
         + (options.payloadBits.empty() ? 0 : 2);
     const size_t sleeps = 1 + options.duties.size() + groups;
     const size_t sweepConfigurations = sweep.size() * (1 + (options.sweepStudies ? 4 + (options.compute ? 1 : 0) : 0)
         + (options.latency ? 4 : 0));
-    const size_t mixedConfigurations = options.mixed ? 3 * MixedFmas.size() : 0; // at duty 100 only
+    const size_t mixedConfigurations = (options.mixed ? 3 * MixedFmas.size() : 0) + (options.mixedInt ? 2 * 4 : 0); // duty 100
     // Three patterns at two footprints each, random data only.
     const size_t writeConfigurations = options.writes ? 3 * 2 * WriteWidths.size() * options.duties.size() : 0;
     const size_t latencyConfigurations = options.latency ? 2 * LatencyChains.size() * LatencyWarps.size() : 0;
@@ -426,8 +463,15 @@ void DescribeSetup(const Hardware& hardware, const Options& options, const Footp
     const size_t patternPayloads = options.payloadBits.empty() ? 0 : 2 + options.payloadBits.size();
     const size_t patternConfigurations = patternPayloads * options.duties.size()
         * (4 + 2 + (hardware.computeCapabilityMajor >= 8 ? 1 : 0));
+    // --lanes: 4 operations at 7 lane counts, random data, every duty.
+    const size_t laneConfigurations = options.lanes ? 5 * LaneCounts.size() * options.duties.size() : 0;
+    // --misaligned: 10 streams (4 and 16 bytes) at every offset.
+    const size_t misalignedConfigurations = options.misaligned ? 10 * MisalignedOffsets.size() * options.duties.size() : 0;
     const size_t configurations = perDuty * options.duties.size() + 1 + sleeps + sweepConfigurations + mixedConfigurations
-        + writeConfigurations + latencyConfigurations + patternConfigurations;
+        + writeConfigurations + latencyConfigurations + patternConfigurations + laneConfigurations
+        + misalignedConfigurations + (options.writePath ? 2 * 2 * 3 * 4 * options.duties.size() : 0)
+        + (options.instrClasses ? InstructionClassOps.size() * options.duties.size() : 0)
+        + (options.l1Sweep ? 2 * 2 * 7 * options.duties.size() : 0);
     const uint64_t fixedS = options.warmupS + 3 * options.idleS;
     std::cout << configurations << " configurations (" << sleeps + sweep.size() << " of them baselines), about "
         << (configurations * options.minTimeMs / 1000 + fixedS) / 60 << "-"

@@ -582,7 +582,18 @@ void ReportProbeRun(std::vector<Row>& rows, const BaselineModel& baseline, const
     PrintRows(rows);
     PrintCounters(rows);
     PrintSummary(rows, fits, footprints, baseline, options, monitor);
-    const nlohmann::json table = PrintStudies(rows, fits, footprints, baseline, hardware, options);
+    nlohmann::json table = PrintStudies(rows, fits, footprints, baseline, hardware, options);
+
+    // For tools/build_model.py: the card and the software the run was made with.
+    if (monitor != nullptr)
+    {
+        const DeviceProvenance provenance = monitor->GetProvenance();
+        const auto textOrNull = [](const std::string& text) { return text.empty() ? nlohmann::json() : nlohmann::json(text); };
+        table["provenance"] = {{"driver_version", textOrNull(provenance.driverVersion)},
+            {"cuda_driver_version", textOrNull(provenance.cudaDriverVersion)}, {"uuid", textOrNull(provenance.uuid)},
+            {"serial", textOrNull(provenance.serial)}, {"power_limit_w", ToJson(provenance.powerLimitW)}};
+    }
+
     WriteCsv(rows, options.outputPrefix + ".csv");
     WriteFitsCsv(fits, options.outputPrefix + "_fits.csv");
     std::ofstream(options.outputPrefix + "_energy_table.json") << table.dump(2) << "\n";

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks of a probe run against what the probes are designed to do: the validation checklist of README.md as tests.
+"""Checks of a probe run against what the probes are designed to do: the validation checklist of docs/CALIBRATION.md as tests.
 
     python3 tools/check_run.py RUN [--counters PROFILED_RUN]
 

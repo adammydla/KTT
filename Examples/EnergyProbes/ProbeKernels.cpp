@@ -270,15 +270,35 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
         row.operation += run.value() == 0 ? "-stream" : "-run" + std::to_string(run.value());
     }
 
+    // --misaligned: an operation of its own per start offset, so that its rows are not fitted with the aligned probes.
+    if (const auto offset = ParameterValue(configuration, "OFFSET_BYTES"))
+    {
+        row.operation += "-off" + std::to_string(offset.value());
+    }
+
     if (const auto spread = ParameterValue(configuration, "SPREAD"))
     {
-        row.operation += spread.value() != 0 ? "-sub-scattered" : "-sub-adjacent";
+        row.operation += spread.value() == 2 ? "-sub-pairs" : spread.value() != 0 ? "-sub-scattered" : "-sub-adjacent";
+    }
+
+    // --write-path: the words accessed per sector (of 32 / WIDTH).
+    // --l1-sweep: sectors and lines per warp instruction.
+    if (const auto sectors = ParameterValue(configuration, "SWEEP_SECTORS"))
+    {
+        row.operation += "-s" + std::to_string(sectors.value()) + "-l"
+            + std::to_string(ParameterValue(configuration, "SWEEP_LINES").value_or(0));
+    }
+
+    if (const auto words = ParameterValue(configuration, "PARTIAL_WORDS"))
+    {
+        row.operation += "-" + std::to_string(words.value()) + "words";
     }
 
     // The mixed-intensity probe: an operation of its own for every number of FFMAs per load.
     if (const auto fmas = ParameterValue(configuration, "MIX_FMAS"))
     {
-        row.operation = MixedName(fmas.value());
+        row.operation = ParameterValue(configuration, "MIX_OP").value_or(0) == 1 ? "ld-int" + std::to_string(fmas.value())
+            : MixedName(fmas.value());
     }
 
     if (footprint.has_value())
@@ -321,6 +341,13 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
         row.operation = ComputeName(computeOp.value());
         row.flopsPerOp = FlopsPerOperation(computeOp.value(), hardware.computeCapabilityMajor);
         row.level = "compute";
+
+        // --lanes: the active lanes per warp; the accesses are counted per thread, active or not (per warp
+        // instruction: times 32).
+        if (const auto lanes = ParameterValue(configuration, "LANES"))
+        {
+            row.operation += "-" + std::to_string(lanes.value());
+        }
     }
     else
     {
@@ -506,6 +533,40 @@ PayloadTexture::PayloadTexture(const uint32_t* data, const size_t bytes, const k
     CheckCuda(cuTexObjectCreate(&m_Texture, &resource, &description, nullptr), "cuTexObjectCreate");
 }
 
+OffsetBuffer::OffsetBuffer(const uint32_t* data, const size_t bytes, const size_t slack, const ktt::DeviceIndex device)
+{
+    CUcontext context = nullptr;
+    CUdevice current = 0;
+    CUdevice expected = 0;
+    CheckCuda(cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+
+    if (context == nullptr)
+    {
+        throw std::runtime_error("no CUDA context is current, cannot create the buffer of --misaligned");
+    }
+
+    CheckCuda(cuCtxGetDevice(&current), "cuCtxGetDevice");
+    CheckCuda(cuDeviceGet(&expected, static_cast<int>(device)), "cuDeviceGet");
+
+    if (current != expected)
+    {
+        throw std::runtime_error("the current CUDA context is not on the selected device");
+    }
+
+    // cuMemAlloc aligns to at least 256 bytes, so offset 0 is on a line.
+    CheckCuda(cuMemAlloc(&m_Buffer, bytes + slack), "cuMemAlloc");
+    CheckCuda(cuMemcpyHtoD(m_Buffer, data, bytes), "cuMemcpyHtoD");
+    CheckCuda(cuMemcpyHtoD(m_Buffer + bytes, data, slack), "cuMemcpyHtoD");
+}
+
+OffsetBuffer::~OffsetBuffer()
+{
+    if (m_Buffer != 0)
+    {
+        cuMemFree(m_Buffer);
+    }
+}
+
 PayloadTexture::~PayloadTexture()
 {
     if (m_Texture != 0)
@@ -574,6 +635,22 @@ ProbeArguments AddProbeArguments(ktt::Tuner& tuner, std::vector<uint32_t>& paylo
         ktt::ArgumentAccessType::ReadWrite) : arguments.data;
     arguments.sink = tuner.AddArgumentVector(sink, ktt::ArgumentAccessType::WriteOnly);
     arguments.counts = tuner.AddArgumentVector(counts, ktt::ArgumentAccessType::ReadWrite);
+
+    // --misaligned: the payload in a buffer of its own with 128 bytes to spare, and one argument per start offset.
+    if (options.misaligned)
+    {
+        const size_t bytes = payload.size() * sizeof(uint32_t);
+        constexpr size_t slack = 128;
+        arguments.offsetBuffer = std::make_shared<OffsetBuffer>(payload.data(), bytes, slack, options.device);
+
+        for (const uint64_t offset : MisalignedOffsets)
+        {
+            arguments.offsetData[offset] = tuner.AddArgumentVector(
+                reinterpret_cast<ktt::ComputeBuffer>(arguments.offsetBuffer->Address() + offset), bytes, sizeof(uint32_t),
+                ktt::ArgumentAccessType::ReadWrite, ktt::ArgumentMemoryLocation::Device);
+        }
+    }
+
     arguments.smCounters = tuner.AddArgumentVector(smCounters, ktt::ArgumentAccessType::ReadWrite);
     // Set per configuration by the launchers.
     arguments.gridSplit = tuner.AddArgumentScalar(static_cast<uint32_t>(0));
@@ -669,10 +746,16 @@ ProbeDefinitions AddProbeDefinitions(ktt::Tuner& tuner, const ProbeArguments& a,
             a.stride, a.activeSms, a.idleRatio, a.duration});
     }
 
-    if (options.subSector)
+    if (options.subSector || options.writePath)
     {
         definitions.partial = add("probePartial", "Partial.cu", {a.data, a.sink, a.counts, a.sectorMask, a.stride,
             a.activeSms, a.idleRatio, a.duration});
+    }
+
+    if (options.l1Sweep)
+    {
+        definitions.l1Sweep = add("probeL1Sweep", "L1Sweep.cu", {a.data, a.sink, a.counts, a.sectorMask, a.activeSms,
+            a.idleRatio, a.duration});
     }
 
     if (!options.payloadBits.empty())
@@ -687,7 +770,7 @@ ProbeDefinitions AddProbeDefinitions(ktt::Tuner& tuner, const ProbeArguments& a,
             a.payloadMask, a.duration});
     }
 
-    if (options.mixed)
+    if (options.mixed || options.mixedInt)
     {
         definitions.mixed = AddMixedDefinition(tuner, a, options, multiprocessors);
     }
@@ -742,6 +825,19 @@ ProbeSettings MakeProbeSettings(const ProbeArguments& a, const ProbeDefinitions&
     auto selectData = [=](ktt::ComputeInterface& interface, const ktt::KernelConfiguration& configuration)
     {
         const uint64_t payload = ParameterValue(configuration, "PAYLOAD").value_or(PayloadRandom);
+
+        // --misaligned: the random payload from a start OFFSET_BYTES into its own buffer.
+        if (const auto offset = ParameterValue(configuration, "OFFSET_BYTES"))
+        {
+            const ktt::ArgumentId view = a.offsetData.at(offset.value());
+
+            if (!interface.HasBuffer(view))
+            {
+                interface.UploadBuffer(view);
+            }
+
+            return view;
+        }
 
         if (payload >= PayloadPatternFirst)
         {
@@ -828,11 +924,24 @@ ProbeSettings MakeProbeSettings(const ProbeArguments& a, const ProbeDefinitions&
         common(interface, configuration);
         const uint32_t sectorMask = static_cast<uint32_t>(ParameterValue(configuration, "FOOTPRINT").value_or(0) / SectorBytes
             - 1);
-        const uint32_t stride = ParameterValue(configuration, "SPREAD").value_or(0) != 0 ? ScatterStride : 1u;
+        // SPREAD 0: the warp's sectors next to each other (4 per L2 request), 2: every other sector (2 per request),
+        // 1: scattered (1 per request).
+        const uint64_t spread = ParameterValue(configuration, "SPREAD").value_or(0);
+        const uint32_t stride = spread == 2 ? 2u : spread != 0 ? ScatterStride : 1u;
         interface.UpdateScalarArgument(a.sectorMask, &sectorMask);
         interface.UpdateScalarArgument(a.stride, &stride);
         interface.ChangeArguments(definitions.partial.value(), {selectData(interface, configuration), a.sink, a.counts,
             a.sectorMask, a.stride, a.activeSms, a.idleRatio, a.duration});
+    };
+
+    // --l1-sweep: the footprint's lines minus 1 in the argument sectorMask.
+    settings.l1Sweep = [=](ktt::ComputeInterface& interface, const ktt::KernelConfiguration& configuration)
+    {
+        common(interface, configuration);
+        const uint32_t lineMask = static_cast<uint32_t>(ParameterValue(configuration, "FOOTPRINT").value_or(0) / 128 - 1);
+        interface.UpdateScalarArgument(a.sectorMask, &lineMask);
+        interface.ChangeArguments(definitions.l1Sweep.value(), {selectData(interface, configuration), a.sink, a.counts,
+            a.sectorMask, a.activeSms, a.idleRatio, a.duration});
     };
 
     // The conflict degree is an argument, so that every degree runs the same SASS.
@@ -896,7 +1005,8 @@ ProbeSettings MakeProbeSettings(const ProbeArguments& a, const ProbeDefinitions&
         if (!isZero(configuration))
         {
             if (operation == ComputeFfma || operation == ComputeDfma || operation == ComputeStaticIndex
-                || operation == ComputeDynamicIndex || operation == ComputeFfma3)
+                || operation == ComputeDynamicIndex || operation == ComputeFfma3 || operation == ComputeFfmaLanes
+                || operation == ComputeFfmaLanesBranch || operation == ComputeFfmaLanesRotating)
             {
                 operandC = FloatBits(-1.9f);
             }
@@ -922,6 +1032,19 @@ ProbeSettings MakeProbeSettings(const ProbeArguments& a, const ProbeDefinitions&
             {
                 operandA = FloatBits(3.0f);
                 operandC = FloatBits(0.5f);
+            }
+            else if (operation == ComputeFadd)
+            {
+                operandC = FloatBits(1.9f); // x -> 1.9 - x
+            }
+            else if (operation == ComputeFmul)
+            {
+                operandA = FloatBits(1.37f); // x -> x * 1.37, then x / 1.37 (as a product)
+                operandC = FloatBits(1.0f / 1.37f);
+            }
+            else if (operation >= ComputeMufuRcp && operation <= ComputeMufuRsq)
+            {
+                operandC = FloatBits(-1.9f); // the FFMA recurrence that feeds the MUFU
             }
         }
 

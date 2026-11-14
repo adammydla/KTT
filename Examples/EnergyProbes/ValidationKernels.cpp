@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <random>
 #include <stdexcept>
 
@@ -16,18 +18,34 @@
 namespace
 {
 
+ValidationInputs inputs;
+
+// Uniform floats in [low, high) from a seed; with --validate-data zero all zeros, with small integers 0 to 15.
 std::vector<float> RandomFloats(const size_t count, const float low, const float high, const uint32_t seed)
 {
     std::mt19937 engine(seed);
     std::uniform_real_distribution<float> distribution(low, high);
-    std::vector<float> values(count);
+    std::uniform_int_distribution<int> small(0, 15);
+    std::vector<float> values(count, 0.0f);
+
+    if (inputs.data == "zero")
+    {
+        return values;
+    }
 
     for (auto& value : values)
     {
-        value = distribution(engine);
+        value = inputs.data == "small" ? static_cast<float>(small(engine)) : distribution(engine);
     }
 
     return values;
+}
+
+// A size times --validate-size-scale, rounded to a multiple of `step`.
+uint32_t Scaled(const uint32_t size, const uint32_t step)
+{
+    const double scaled = std::round(size * inputs.sizeScale / step) * step;
+    return static_cast<uint32_t>(std::max(scaled, static_cast<double>(step)));
 }
 
 bool IsMultiple(const uint64_t a, const uint64_t b)
@@ -91,9 +109,9 @@ ValidationKernel AddTranspose(ktt::Tuner& tuner, const std::string& directory)
 // GEMM (CLTune's kernel, reduced parameter set of the example): C = A * B for 4096 x 4096 floats, FFMA and shared memory.
 ValidationKernel AddGemm(ktt::Tuner& tuner, const std::string& directory)
 {
-    const uint32_t m = 4096;
-    const uint32_t n = 4096;
-    const uint32_t k = 4096;
+    const uint32_t m = Scaled(4096, 64);
+    const uint32_t n = Scaled(4096, 64);
+    const uint32_t k = Scaled(4096, 64);
     const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("gemm_fast",
         directory + "ClTuneGemm/ClTuneGemm.cu", ktt::DimensionVector(m, n), ktt::DimensionVector(1, 1));
     const ktt::KernelId kernel = tuner.CreateSimpleKernel("Gemm", definition);
@@ -350,8 +368,8 @@ ValidationKernel AddConvolution(ktt::Tuner& tuner, const std::string& directory)
 {
     const int hfs = 3;
     const int fs = 2 * hfs + 1;
-    const uint32_t sizeX = 16384;
-    const uint32_t sizeY = 16384;
+    const uint32_t sizeX = Scaled(16384, 1024);
+    const uint32_t sizeY = Scaled(16384, 1024);
     const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("conv",
         directory + "ClTuneConvolution/ClTuneConvolution.cu", ktt::DimensionVector(sizeX, sizeY), ktt::DimensionVector(1, 1));
     const ktt::KernelId kernel = tuner.CreateSimpleKernel("Convolution", definition);
@@ -484,7 +502,189 @@ ValidationKernel AddPnpoly(ktt::Tuner& tuner, const std::string& directory)
     return {"pnpoly", kernel, definition, ""};
 }
 
+// The second held-out set (--validate heldout2, 2026-11-13): KTT examples not used before, taken after the model was
+// built and not looked at while changing it. Of the plan's candidates only these two are single CUDA kernels with a tuning
+// space: Covariance, Convolution3d, CoulombSum2d and CoulombSum3dIterative have OpenCL sources only, FluidSimulation has
+// no kernel source in this checkout, and Sort / Sort2 run 3 / 5 kernels 8 times per sort (a composite launcher), which the
+// validation's timing and counter passes (one kernel per configuration) do not cover.
+
+// BiCG of PolyBench (Bicg example): y1 = A x1 and y2 = A^T x2 in one fused kernel. A is 32768 x 16384 floats (2 GiB, about
+// 2.5 ms per launch). Only ATOMICS 1: with 0 the example runs two reduction kernels after the fused one.
+ValidationKernel AddBicg(ktt::Tuner& tuner, const std::string& directory)
+{
+    const int m = 16384;
+    const int n = 32768;
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("bicgFused", directory + "Bicg/Bicg.cu",
+        ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("Bicg", definition);
+
+    const std::vector<float> a = RandomFloats(static_cast<size_t>(m) * n, 0.0f, 100.0f, 21);
+    const std::vector<float> x1 = RandomFloats(static_cast<size_t>(m), 0.0f, 100.0f, 22);
+    const std::vector<float> x2 = RandomFloats(static_cast<size_t>(n), 0.0f, 100.0f, 23);
+    const std::vector<float> y1(static_cast<size_t>(n), 0.0f);
+    const std::vector<float> y2(static_cast<size_t>(m), 0.0f);
+    const ktt::ArgumentId aId = tuner.AddArgumentVector(a, ktt::ArgumentAccessType::ReadOnly);
+    const ktt::ArgumentId x1Id = tuner.AddArgumentVector(x1, ktt::ArgumentAccessType::ReadOnly);
+    const ktt::ArgumentId y1Id = tuner.AddArgumentVector(y1, ktt::ArgumentAccessType::ReadWrite);
+    const ktt::ArgumentId x2Id = tuner.AddArgumentVector(x2, ktt::ArgumentAccessType::ReadOnly);
+    const ktt::ArgumentId y2Id = tuner.AddArgumentVector(y2, ktt::ArgumentAccessType::ReadWrite);
+    const ktt::ArgumentId mId = tuner.AddArgumentScalar(m);
+    const ktt::ArgumentId nId = tuner.AddArgumentScalar(n);
+    tuner.SetArguments(definition, {aId, x1Id, y1Id, x2Id, y2Id, mId, nId});
+
+    tuner.AddParameter(kernel, "FUSED", std::vector<uint64_t>{2});
+    tuner.AddParameter(kernel, "BICG_BATCH", std::vector<uint64_t>{1, 2, 4, 8, 16, 32, 64});
+    tuner.AddParameter(kernel, "USE_SHARED_MATRIX", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "USE_SHARED_VECTOR_1", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "USE_SHARED_VECTOR_2", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "USE_SHARED_REDUCTION_1", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "USE_SHARED_REDUCTION_2", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "ATOMICS", std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "UNROLL_BICG_STEP", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "ROWS_PROCESSED", std::vector<uint64_t>{128, 256, 512, 1024});
+    tuner.AddParameter(kernel, "TILE", std::vector<uint64_t>{16, 32, 64});
+
+    // The example's thread space (OpenCL sizes there): m threads by n / ROWS_PROCESSED x TILE / BICG_BATCH in blocks of
+    // TILE x TILE / BICG_BATCH, i.e. a grid of m / TILE by n / ROWS_PROCESSED blocks.
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X, {"TILE"},
+        [m](const uint64_t, const std::vector<uint64_t>& v) { return static_cast<uint64_t>(m) / v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y, {"ROWS_PROCESSED"},
+        [n](const uint64_t, const std::vector<uint64_t>& v) { return static_cast<uint64_t>(n) / v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"TILE"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y, {"TILE", "BICG_BATCH"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0] / v[1]; });
+    tuner.AddConstraint(kernel, {"TILE", "BICG_BATCH"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[0] / v[1] <= 1024 && v[1] <= v[0]; });
+
+    return {"bicg", kernel, definition, ""};
+}
+
+// Kernel Tuner's 2-D convolution (KernelTunerConvolution example) on the task of ClTuneConvolution here: a 16384 x 16384
+// image and the same normalised 7 x 7 Gaussian filter, so that the two kernels form a pair for one task. The filter is read
+// from constant memory (d_filter), which the example never fills; here it is filled as a symbol argument. The example's
+// PADDING parameter is not read by the kernel, which tests use_padding: the parameter is use_padding here.
+ValidationKernel AddKtConvolution(ktt::Tuner& tuner, const std::string& directory)
+{
+    constexpr int hfs = 3;
+    constexpr int fs = 2 * hfs + 1;
+    const uint32_t sizeX = 16384;
+    const uint32_t sizeY = 16384;
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("Convolution",
+        directory + "KernelTunerConvolution/KernelTunerConvolution.cu", ktt::DimensionVector(sizeX, sizeY),
+        ktt::DimensionVector(1, 1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("KtConvolution", definition);
+
+    // The same input as ClTuneConvolution (seed 12, values in [-2, 2], a halo of zeros).
+    std::vector<float> input(static_cast<size_t>(sizeX + 2 * hfs) * (sizeY + 2 * hfs), 0.0f);
+    const std::vector<float> values = RandomFloats(static_cast<size_t>(sizeX) * sizeY, -2.0f, 2.0f, 12);
+
+    for (size_t y = 0; y < sizeY; ++y)
+    {
+        std::copy_n(values.cbegin() + static_cast<std::ptrdiff_t>(y * sizeX), sizeX,
+            input.begin() + static_cast<std::ptrdiff_t>((y + hfs) * (sizeX + 2 * hfs) + hfs));
+    }
+
+    std::array<float, 33 * 33> filter{};
+    float sum = 0.0f;
+
+    for (int x = 0; x < fs; ++x)
+    {
+        for (int y = 0; y < fs; ++y)
+        {
+            const float mean = fs / 2.0f;
+            filter[static_cast<size_t>(y * fs + x)] = std::exp(-0.5f * ((x - mean) * (x - mean) + (y - mean) * (y - mean)));
+            sum += filter[static_cast<size_t>(y * fs + x)];
+        }
+    }
+
+    for (auto& value : filter)
+    {
+        value /= sum;
+    }
+
+    const std::vector<float> filterVector(filter.cbegin(), filter.cend());
+    const std::vector<float> output(static_cast<size_t>(sizeX) * sizeY, 0.0f);
+    const ktt::ArgumentId outputId = tuner.AddArgumentVector(output, ktt::ArgumentAccessType::WriteOnly);
+    const ktt::ArgumentId inputId = tuner.AddArgumentVector(input, ktt::ArgumentAccessType::ReadOnly);
+    const ktt::ArgumentId filterId = tuner.AddArgumentVector(filterVector, ktt::ArgumentAccessType::ReadOnly);
+    const ktt::ArgumentId symbolId = tuner.AddArgumentSymbol(filter, "", "d_filter");
+    tuner.SetArguments(definition, {outputId, inputId, filterId, symbolId});
+
+    tuner.AddParameter(kernel, "IMAGE_WIDTH", std::vector<uint64_t>{sizeX});
+    tuner.AddParameter(kernel, "IMAGE_HEIGHT", std::vector<uint64_t>{sizeY});
+    tuner.AddParameter(kernel, "HFS", std::vector<uint64_t>{hfs});
+    tuner.AddParameter(kernel, "BLOCK_SIZE_X", std::vector<uint64_t>{1, 2, 4, 8, 16, 32, 48, 64, 96, 112, 128});
+    tuner.AddParameter(kernel, "BLOCK_SIZE_Y", std::vector<uint64_t>{1, 2, 4, 8, 16, 32});
+    tuner.AddParameter(kernel, "TILE_SIZE_X", std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8});
+    tuner.AddParameter(kernel, "TILE_SIZE_Y", std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8});
+    tuner.AddParameter(kernel, "use_padding", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "READ_ONLY", std::vector<uint64_t>{0, 1});
+
+    const auto blocks = [](const uint64_t size, const std::vector<uint64_t>& v)
+    {
+        return ((size + v[0] - 1) / v[0] + v[1] - 1) / v[1];
+    };
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X,
+        {"BLOCK_SIZE_X", "TILE_SIZE_X"}, blocks);
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y,
+        {"BLOCK_SIZE_Y", "TILE_SIZE_Y"}, blocks);
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, "BLOCK_SIZE_X",
+        ktt::ModifierAction::Multiply);
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y, "BLOCK_SIZE_Y",
+        ktt::ModifierAction::Multiply);
+    tuner.AddConstraint(kernel, {"BLOCK_SIZE_X", "BLOCK_SIZE_Y"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] >= 64 && v[0] * v[1] <= 1024; });
+    tuner.AddConstraint(kernel, {"TILE_SIZE_X", "TILE_SIZE_Y"}, [](const std::vector<uint64_t>& v) { return v[0] * v[1] < 30; });
+    // Not in the example: the shared tile (with up to 31 padding columns) must fit in 48 KiB.
+    tuner.AddConstraint(kernel, {"BLOCK_SIZE_X", "TILE_SIZE_X", "BLOCK_SIZE_Y", "TILE_SIZE_Y"}, [](const std::vector<uint64_t>& v)
+        { return (v[2] * v[3] + 2 * hfs) * (v[0] * v[1] + 2 * hfs + 31) * sizeof(float) <= 48 * 1024; });
+
+    return {"ktconvolution", kernel, definition, ""};
+}
+
 } // namespace
+
+void SetValidationInputs(const ValidationInputs& values)
+{
+    inputs = values;
+}
+
+SeededSearcher::SeededSearcher(const uint64_t seed) :
+    m_Seed(seed)
+{}
+
+void SeededSearcher::OnInitialize()
+{
+    // A fixed permutation of the configuration indices: the first ones are the configurations a run measures.
+    m_Order.resize(GetConfigurationsCount());
+
+    for (uint64_t i = 0; i < m_Order.size(); ++i)
+    {
+        m_Order[i] = i;
+    }
+
+    std::mt19937_64 engine(m_Seed);
+    std::shuffle(m_Order.begin(), m_Order.end(), engine);
+    m_Next = 0;
+    m_Current = GetConfiguration(m_Order[m_Next]);
+}
+
+bool SeededSearcher::CalculateNextConfiguration([[maybe_unused]] const ktt::KernelResult& previousResult)
+{
+    if (m_Next + 1 >= m_Order.size())
+    {
+        return false;
+    }
+
+    m_Current = GetConfiguration(m_Order[++m_Next]);
+    return true;
+}
+
+ktt::KernelConfiguration SeededSearcher::GetCurrentConfiguration() const
+{
+    return m_Current;
+}
 
 std::vector<std::string> ValidationKernelNames()
 {
@@ -496,8 +696,225 @@ std::vector<std::string> HeldOutKernelNames()
     return {"reduction", "convolution", "pnpoly"};
 }
 
+std::vector<std::string> HeldOut2KernelNames()
+{
+    return {"bicg", "ktconvolution"};
+}
+
+std::vector<std::string> HeldOut3KernelNames()
+{
+    return {"gesummv", "syrk", "syr2k", "conv2d", "conv3d"};
+}
+
+// AccelWattch's microbenchmarks: one kernel awKernel with a configuration per benchmark (AW_BENCH), its grid and block
+// from accelwattch.tsv. Every benchmark gets four pointer arguments (unused ones are padded in the kernel), each a buffer
+// of the largest allocation any benchmark makes (at least 16 MiB), filled with a repeated 16 MiB pattern of random
+// floats in [1, 2) (the programs' RandomInit gives random values too; the kernels only sum or copy them).
+ValidationKernel AddAccelWattch(ktt::Tuner& tuner)
+{
+    const std::string directory = inputs.accelwattchDirectory;
+
+    if (directory.empty())
+    {
+        throw std::runtime_error("--validate accelwattch needs --accelwattch-dir (run tools/accelwattch_import.py first)");
+    }
+
+    std::ifstream table(directory + "accelwattch.tsv");
+
+    if (!table)
+    {
+        throw std::runtime_error("cannot read " + directory + "accelwattch.tsv");
+    }
+
+    struct Bench
+    {
+        uint64_t grid;
+        uint64_t block;
+        uint64_t bytes;
+    };
+
+    std::vector<Bench> benches;
+    std::vector<uint64_t> indices;
+    std::string line;
+
+    while (std::getline(table, line))
+    {
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+
+        std::stringstream fields(line);
+        std::string index, name, grid, block, iterations, pointers, bytes;
+        std::getline(fields, index, '\t');
+        std::getline(fields, name, '\t');
+        std::getline(fields, grid, '\t');
+        std::getline(fields, block, '\t');
+        std::getline(fields, iterations, '\t');
+        std::getline(fields, pointers, '\t');
+        std::getline(fields, bytes, '\t');
+
+        if (std::stoull(index) != benches.size())
+        {
+            throw std::runtime_error(directory + "accelwattch.tsv: indices must be 0, 1, 2, ... in order");
+        }
+
+        benches.push_back({std::stoull(grid), std::stoull(block), bytes.empty() ? 0 : std::stoull(bytes)});
+        indices.push_back(benches.size() - 1);
+    }
+
+    if (benches.empty())
+    {
+        throw std::runtime_error(directory + "accelwattch.tsv lists no benchmark");
+    }
+
+    uint64_t bytes = 16ull << 20;
+
+    for (const auto& bench : benches)
+    {
+        bytes = std::max(bytes, bench.bytes);
+    }
+
+    const size_t count = static_cast<size_t>((bytes + sizeof(float) - 1) / sizeof(float));
+    const std::vector<float> pattern = RandomFloats(4u << 20, 1.0f, 2.0f, 31);
+    std::vector<float> data(count);
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        data[i] = pattern[i % pattern.size()];
+    }
+
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("awKernel", directory + "AccelWattch.cu",
+        ktt::DimensionVector(1), ktt::DimensionVector(1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("AccelWattch", definition);
+    std::vector<ktt::ArgumentId> arguments;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        arguments.push_back(tuner.AddArgumentVector(data, ktt::ArgumentAccessType::ReadWrite));
+    }
+
+    tuner.SetArguments(definition, arguments);
+    tuner.AddParameter(kernel, "AW_BENCH", indices);
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X, {"AW_BENCH"},
+        [benches](const uint64_t, const std::vector<uint64_t>& v) { return benches[v[0]].grid; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"AW_BENCH"},
+        [benches](const uint64_t, const std::vector<uint64_t>& v) { return benches[v[0]].block; });
+    return {AccelWattchName, kernel, definition, ""};
+}
+
+// The third held-out set (NEXT_STEPS_PLAN M6): PolyBench/GPU kernels with a small tuning space each
+// (kernels/HeldOut3.cu). Sizes: PolyBench's standard data sets, the 2-D convolution doubled to 8192 x 8192 so that a launch
+// takes milliseconds.
+ValidationKernel AddPolyBench(ktt::Tuner& tuner, const std::string& name, const std::string& examplesDirectory)
+{
+    const std::string file = examplesDirectory + "EnergyProbes/kernels/HeldOut3.cu";
+    const auto blocks = [](const uint64_t size, const uint64_t per) { return (size + per - 1) / per; };
+    ktt::KernelDefinitionId definition = 0;
+    std::vector<ktt::ArgumentId> arguments;
+    uint64_t sizeX = 0;
+    uint64_t sizeY = 1;
+
+    if (name == "gesummv")
+    {
+        const int n = 4096;
+        definition = tuner.AddKernelDefinitionFromFile("gesummv", file, ktt::DimensionVector(1), ktt::DimensionVector(1));
+        const size_t square = static_cast<size_t>(n) * n;
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(1.5f), tuner.AddArgumentScalar(1.2f),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 41), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 42), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), ktt::ArgumentAccessType::ReadWrite),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 43), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = n;
+    }
+    else if (name == "syrk" || name == "syr2k")
+    {
+        const int ni = 1024;
+        const int nj = 1024;
+        const size_t elements = static_cast<size_t>(ni) * nj;
+        definition = tuner.AddKernelDefinitionFromFile(name, file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(ni), tuner.AddArgumentScalar(nj), tuner.AddArgumentScalar(1.5f),
+            tuner.AddArgumentScalar(1.2f),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 44), ktt::ArgumentAccessType::ReadOnly)};
+        if (name == "syr2k")
+        {
+            arguments.push_back(tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 45),
+                ktt::ArgumentAccessType::ReadOnly));
+        }
+        arguments.push_back(tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(ni) * ni, 0.0f, 1.0f, 46),
+            ktt::ArgumentAccessType::ReadWrite));
+        sizeX = ni;
+        sizeY = ni;
+    }
+    else if (name == "conv2d")
+    {
+        const int ni = 8192;
+        const int nj = 8192;
+        const size_t elements = static_cast<size_t>(ni) * nj;
+        definition = tuner.AddKernelDefinitionFromFile("conv2d", file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(ni), tuner.AddArgumentScalar(nj),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 47), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(elements, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = nj;
+        sizeY = ni;
+    }
+    else
+    {
+        const int n = 256;
+        const size_t elements = static_cast<size_t>(n) * n * n;
+        definition = tuner.AddKernelDefinitionFromFile("conv3d", file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 48), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(elements, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = n;
+        sizeY = n;
+    }
+
+    tuner.SetArguments(definition, arguments);
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("PolyBench_" + name, definition);
+    const bool twoD = name != "gesummv";
+    tuner.AddParameter(kernel, "BLOCK_X", name == "gesummv" ? std::vector<uint64_t>{32, 64, 128, 256, 512, 1024}
+        : name == "syrk" || name == "syr2k" ? std::vector<uint64_t>{8, 16, 32, 64} : std::vector<uint64_t>{16, 32, 64, 128, 256});
+    tuner.AddParameter(kernel, "BLOCK_Y", twoD ? (name == "conv3d" ? std::vector<uint64_t>{1, 2, 4, 8}
+        : std::vector<uint64_t>{1, 2, 4, 8, 16, 32}) : std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "UNROLL", name == "gesummv" ? std::vector<uint64_t>{1, 2, 4, 8} : std::vector<uint64_t>{1, 4});
+    tuner.AddParameter(kernel, "ACC_REGISTER", name == "gesummv" || name == "syrk" || name == "syr2k"
+        ? std::vector<uint64_t>{0, 1} : std::vector<uint64_t>{0});
+    tuner.AddParameter(kernel, "ITEMS_Y", name == "conv2d" ? std::vector<uint64_t>{1, 2, 4} : std::vector<uint64_t>{1});
+    tuner.AddConstraint(kernel, {"BLOCK_X", "BLOCK_Y"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] >= 32 && v[0] * v[1] <= 1024; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [sizeX, blocks](const uint64_t, const std::vector<uint64_t>& v) { return blocks(sizeX, v[0]); });
+
+    if (twoD)
+    {
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y, {"BLOCK_Y"},
+            [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y,
+            {"BLOCK_Y", "ITEMS_Y"}, [sizeY, blocks](const uint64_t, const std::vector<uint64_t>& v)
+            { return blocks(sizeY, v[0] * v[1]); });
+    }
+
+    return {name, kernel, definition, ""};
+}
+
 ValidationKernel AddValidationKernel(ktt::Tuner& tuner, const std::string& name, const std::string& examplesDirectory)
 {
+    if (name == AccelWattchName)
+    {
+        return AddAccelWattch(tuner);
+    }
+
+    const std::vector<std::string> heldOut3 = HeldOut3KernelNames();
+
+    if (std::find(heldOut3.cbegin(), heldOut3.cend(), name) != heldOut3.cend())
+    {
+        return AddPolyBench(tuner, name, examplesDirectory);
+    }
+
     if (name == "transpose")
     {
         return AddTranspose(tuner, examplesDirectory);
@@ -531,6 +948,16 @@ ValidationKernel AddValidationKernel(ktt::Tuner& tuner, const std::string& name,
     if (name == "pnpoly")
     {
         return AddPnpoly(tuner, examplesDirectory);
+    }
+
+    if (name == "bicg")
+    {
+        return AddBicg(tuner, examplesDirectory);
+    }
+
+    if (name == "ktconvolution")
+    {
+        return AddKtConvolution(tuner, examplesDirectory);
     }
 
     throw std::runtime_error("unknown validation kernel " + name);

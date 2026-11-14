@@ -126,8 +126,47 @@ enum ComputeOp : uint64_t
     ComputeBar = 11,         // block barrier,
     ComputeFfmaLoop = 12,    // the FFMA chain in a loop that is not unrolled (branches),
     ComputeFmulFadd = 13,    // x * x + c as a separate FMUL and FADD,
-    ComputeMufuSin = 14      // MUFU.SIN
+    ComputeMufuSin = 14,     // MUFU.SIN
+    // --lanes: partially active warps, LANES of 32 lanes active
+    ComputeFfmaLanes = 15,       // FFMA with a guard predicate,
+    ComputeFfmaLanesBranch = 16, // FFMA, the other lanes branch around the body,
+    ComputeIaddLanes = 17,       // IADD with a guard predicate,
+    ComputeIaddLanesBranch = 18, // IADD in a branch
+    // --instr-classes: instruction classes inside one event
+    ComputeLop3 = 19,     // xor chain (ptxas merges pairs into three-input LOP3s)
+    ComputeShf = 20,      // rotate by a variable amount
+    ComputeImnmx = 21,    // min, then xor
+    ComputeFadd = 22,     // x -> c - x
+    ComputeFmul = 23,     // x -> x * k, then x * (1 / k)
+    ComputeMufuRcp = 24,  // the FFMA recurrence, MUFU, FADD into a sum
+    ComputeMufuSqrt = 25,
+    ComputeMufuEx2 = 26,
+    ComputeMufuLg2 = 27,
+    ComputeMufuRsq = 28,
+    // --instr-classes, added 2026-11-14 (NEXT_STEPS_PLAN M4)
+    // (A register move cannot be measured alone: ptxas removes moves that the PTX asks for.)
+    ComputeIsetpSel = 29, // integer compare + select
+    ComputeFsetpSel = 30, // float compare + select
+    ComputeCvt = 31,      // integer -> float, FADD, -> integer (ptxas folds the two conversions without the FADD)
+    ComputeFmnmx = 32,    // float min, then max
+    ComputeIadd3 = 33,    // three-input integer add
+    // --lanes, added 2026-11-14 (NEXT_STEPS_PLAN M5)
+    ComputeFfmaLanesRotating = 34 // FFMA with a guard predicate, the active lanes rotating from step to step
 };
+
+// --instr-classes: the operations of the group.
+inline const std::vector<uint64_t> InstructionClassOps = {ComputeLop3, ComputeShf, ComputeImnmx, ComputeFadd, ComputeFmul,
+    ComputeMufuRcp, ComputeMufuSqrt, ComputeMufuEx2, ComputeMufuLg2, ComputeMufuRsq, ComputeIsetpSel,
+    ComputeFsetpSel, ComputeCvt, ComputeFmnmx, ComputeIadd3};
+
+// --misaligned: start offsets in bytes (0 = aligned; 16 = half a sector; 32, 64, 96 = 1-3 sectors off the line). Multiples
+// of 16 only: the store probe seeds its values with a 16-byte read at the start of its data (a 4-byte offset stopped the
+// run with CUDA_ERROR_MISALIGNED_ADDRESS).
+inline const std::vector<uint64_t> MisalignedOffsets = {0, 16, 32, 64, 96};
+
+// --lanes: the active lanes per warp of the partially active probes.
+// 0 since 2026-11-14 (M5): the step from no active lane to one is the whole fixed part of a warp instruction.
+inline const std::vector<uint64_t> LaneCounts = {0, 1, 2, 4, 8, 16, 24, 32};
 
 // PAYLOAD parameter: the data the probes read, store or compute on.
 enum Payload : uint64_t

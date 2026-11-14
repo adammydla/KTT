@@ -66,16 +66,35 @@ struct Options
     std::vector<std::string> validate; // KTT example kernels to measure instead of the probes (--validate)
     uint64_t validateConfigs = 24;     // random configurations per kernel
     uint64_t validateMs = 4000;        // measurement time per configuration
+    uint64_t validateRepeat = 1;       // --validate-repeat: power measurements per configuration, in rounds over all kernels
+    std::optional<uint64_t> validateSeed; // --validate-seed: the same configurations in every run with this seed
+    std::string validateData = "random"; // --validate-data: random, zero or small (the example kernels' inputs)
+    double validateSizeScale = 1.0;    // --validate-size-scale: gemm's and convolution's sizes times this
+    std::string accelwattchDirectory;  // --accelwattch-dir: the output of tools/accelwattch_import.py
     std::vector<std::string> tune;     // --tune: example kernels to tune with the energy model (no power measurement)
     std::string modelFile;             // --model-file: the model for --tune and --predict (tools/build_model.py)
     std::string predictCsv;            // --predict: a --validate run's CSV to predict without a GPU
     std::string objective = "energy";  // --objective: energy, edp, ed2p or time
     std::optional<double> maxSlowdownPct; // --max-slowdown: only configurations at most this much slower than the fastest
+    std::optional<double> maxEnergyIncreasePct; // --max-energy-increase: only those at most this much above the lowest energy
+    std::string accounting = "awake";  // --accounting: awake, above-idle or dynamic (which baseline the energy includes)
+    std::optional<double> idleW;       // --idle-w: the idle power for --accounting above-idle (default: the model file's)
     double contenderSd = 2.0;          // --contender-sd: configurations within this many sd of the best are contenders
+    std::optional<uint64_t> tuneScaleConfigs; // --tune-scale-configs (default: 5 with more than one kernel, else 0)
     std::string tuneMeasure = "none";  // --tune-measure: none, contenders or all (NVML power of the candidates)
+    double measureMarginPct = 1.0;     // --measure-margin: measured candidates this close to the best are not told apart
     bool lenient = false;              // --lenient: counters the model needs and does not find become warnings
     bool dryRun = false;
-    bool thermalCurve = false; // --thermal-curve: the baseline's power over temperature, not the probes
+    bool thermalCurve = false;
+    bool thermalLoad = false;
+    bool studyCounters = false;
+    bool mixedInt = false;
+    bool l1Sweep = false;              // --l1-sweep: L1 loads and stores with 1-32 sectors in 1-32 lines per instruction (M2)             // --mixed-int: loads with 0-16 address-like integer instructions per load (M2)        // --study-counters: also the screening counters of tools/counters.json          // --thermal-load: power over temperature under load (NEXT_STEPS_PLAN M1)
+    uint64_t thermalHoldS = 90;        // --thermal-hold: seconds each probe is held in --thermal-load
+    bool lanes = false;
+    bool instrClasses = false; // --instr-classes: LOP3, SHF, IMNMX, FADD, FMUL and MUFU variants
+    bool writePath = false;  // --write-path: 1, 2, 4 or 8 words of a sector x 1, 2 or 4 sectors per L2 request
+    bool misaligned = false; // --misaligned: the 16- and 4-byte stream load and store started off the 128-byte line // --lanes: FFMA and IADD with 1 to 32 active lanes per warp (predicate and branch) // --thermal-curve: the baseline's power over temperature, not the probes
     std::string analyzePrefix; // --analyze: analyse the CSV of an earlier run instead of measuring
     bool forceEnergy = false;
     bool clockLockedExternally = false; // locked with nvidia-smi -lgc by someone else

@@ -9,3 +9,4 @@ int RunProbes(const Options& options);
 
 // --thermal-curve: the sleep baseline's power over temperature while the GPU cools and heats (no probes).
 int RunThermalCurve(const Options& options);
+int RunThermalLoad(const Options& options);

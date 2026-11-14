@@ -15,7 +15,33 @@ namespace
 constexpr int ModelVersion = 1;
 constexpr double ClockTolerance = 0.05; // relative; beyond it a prediction is only good for ranking
 constexpr double UnpricedShare = 0.01;  // of the warp instructions; from here an unpriced event gets a warning
+// How closely a GPU at its power limit holds it (energy_predictor.py LIMIT_RELATIVE_SD: ValFree1, sd 2.1 %).
+constexpr double LimitRelativeSd = 0.021;
 const double NotANumber = std::numeric_limits<double>::quiet_NaN();
+
+// The keys a model file must have; the same list as energy_predictor.py REQUIRED_KEYS.
+const std::vector<std::vector<std::string>> RequiredKeys = {{"device"}, {"options"}, {"events"}, {"baseline", "mean_w"},
+    {"baseline", "mean_temperature_c"}, {"baseline", "slope_w_per_c"}, {"uncertainty", "dynamic_relative_sd"},
+    {"counters", "required"}, {"counters", "lsu_shared"}, {"counters", "lsu_global"}, {"counters", "aliases"}};
+
+// Optional counters for model files from before 2026-11-13 (energy_predictor.py OPTIONAL_COUNTERS).
+const std::vector<std::string> DefaultOptional = {"sm__thread_inst_executed_pipe_alu_pred_on.sum",
+    "sm__thread_inst_executed_pipe_fma_pred_on.sum", "sm__thread_inst_executed_pipe_fp16_pred_on.sum",
+    "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum", "smsp__inst_executed_pipe_fp16.sum",
+    "smsp__inst_executed_pipe_fma_type_fp16.sum", "sm__thread_inst_executed_pipe_fmalite_pred_on.sum"};
+
+// A counter value for a message, without trailing zeros.
+std::string ValueText(const double value)
+{
+    if (std::isinf(value))
+    {
+        return value > 0.0 ? "inf" : "-inf";
+    }
+
+    std::string text = std::to_string(value);
+    text.erase(text.find_last_not_of('0') + 1);
+    return text.back() == '.' ? text.substr(0, text.size() - 1) : text;
+}
 
 double NumberOr(const nlohmann::json& object, const char* key, const double fallback)
 {
@@ -30,7 +56,8 @@ std::string Percent(const double fraction)
 
 } // namespace
 
-EnergyModel::EnergyModel(const std::string& file)
+EnergyModel::EnergyModel(const std::string& file) :
+    m_File(file)
 {
     std::ifstream input(file);
 
@@ -40,9 +67,17 @@ EnergyModel::EnergyModel(const std::string& file)
     }
 
     nlohmann::json root;
-    input >> root;
 
-    if (root.value("format", std::string()) != "energyprobes-model")
+    try
+    {
+        input >> root;
+    }
+    catch (const nlohmann::json::exception& error)
+    {
+        throw std::runtime_error(file + ": not JSON (" + error.what() + ")");
+    }
+
+    if (!root.is_object() || root.value("format", std::string()) != "energyprobes-model")
     {
         throw std::runtime_error(file + " is not an EnergyProbes model file");
     }
@@ -51,6 +86,38 @@ EnergyModel::EnergyModel(const std::string& file)
     {
         throw std::runtime_error(file + " has a newer format version than this program knows");
     }
+
+    for (const auto& key : RequiredKeys)
+    {
+        const nlohmann::json* entry = &root;
+        std::string path;
+
+        for (const auto& part : key)
+        {
+            path += (path.empty() ? "" : "/") + part;
+
+            if (!entry->is_object() || !entry->contains(part))
+            {
+                throw std::runtime_error(file + ": missing " + path);
+            }
+
+            entry = &entry->at(part);
+        }
+    }
+
+    try
+    {
+        Load(root);
+    }
+    catch (const nlohmann::json::exception& error)
+    {
+        throw std::runtime_error(file + ": " + error.what());
+    }
+}
+
+void EnergyModel::Load(const nlohmann::json& root)
+{
+    const std::string& file = m_File;
 
     const auto& device = root.at("device");
     m_Device = device.value("name", std::string());
@@ -120,6 +187,75 @@ EnergyModel::EnergyModel(const std::string& file)
     m_RelativeSd = uncertainty.at("dynamic_relative_sd").get<double>();
     m_BaselineSdW = NumberOr(uncertainty, "baseline_sd_w", 0.0);
     m_UnknownTemperatureSdW = NumberOr(uncertainty, "baseline_unknown_temperature_sd_w", 0.0);
+    m_BetweenKernelsSd = NumberOr(uncertainty, "dynamic_bias_sd_between_kernels", NotANumber);
+    m_ContextIdleW = NumberOr(baseline, "context_idle_w", NotANumber);
+    m_Optional = counters.contains("optional") && counters.at("optional").is_array()
+        ? counters.at("optional").get<std::vector<std::string>>() : DefaultOptional;
+}
+
+double EnergyModel::IdlePowerW() const
+{
+    if (!std::isnan(m_IdleW))
+    {
+        return m_IdleW;
+    }
+
+    if (std::isnan(m_ContextIdleW))
+    {
+        throw std::runtime_error(m_File + ": no idle power in the file (rebuild it with tools/build_model.py, or give "
+            "the idle power: --idle-w)");
+    }
+
+    return m_ContextIdleW;
+}
+
+double EnergyModel::BetweenKernelsSd() const
+{
+    return std::isnan(m_BetweenKernelsSd) ? m_RelativeSd : m_BetweenKernelsSd;
+}
+
+double EnergyModel::KernelScale(const std::string& group, const std::vector<EnergyPrediction>& predictions,
+    const std::vector<double>& measuredDynamicJ, const size_t minimum)
+{
+    double sum = 0.0;
+    size_t count = 0;
+
+    for (size_t i = 0; i < predictions.size() && i < measuredDynamicJ.size(); ++i)
+    {
+        if (predictions[i].unscaledDynamicJ > 0.0 && measuredDynamicJ[i] > 0.0)
+        {
+            sum += measuredDynamicJ[i] / predictions[i].unscaledDynamicJ;
+            ++count;
+        }
+    }
+
+    if (count < minimum || count == 0)
+    {
+        return NotANumber;
+    }
+
+    m_KernelScales[group] = {sum / static_cast<double>(count), count};
+    return m_KernelScales[group].first;
+}
+
+EnergyAccounting AccountingOf(const std::string& name)
+{
+    if (name == "awake")
+    {
+        return EnergyAccounting::Awake;
+    }
+
+    if (name == "above-idle")
+    {
+        return EnergyAccounting::AboveIdle;
+    }
+
+    if (name == "dynamic")
+    {
+        return EnergyAccounting::Dynamic;
+    }
+
+    throw std::runtime_error("the accounting must be awake, above-idle or dynamic, not " + name);
 }
 
 std::vector<std::string> EnergyModel::Counters() const
@@ -137,13 +273,7 @@ std::vector<std::string> EnergyModel::Counters() const
     }
 
     // The lane counters and the two fp16 variants: optional, each GPU has the ones of its architecture.
-    for (const char* name : {"sm__thread_inst_executed_pipe_alu_pred_on.sum", "sm__thread_inst_executed_pipe_fma_pred_on.sum",
-        "sm__thread_inst_executed_pipe_fp16_pred_on.sum", "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum",
-        "smsp__inst_executed_pipe_fp16.sum", "smsp__inst_executed_pipe_fma_type_fp16.sum",
-        "sm__thread_inst_executed_pipe_fmalite_pred_on.sum"})
-    {
-        names.emplace_back(name);
-    }
+    names.insert(names.end(), m_Optional.cbegin(), m_Optional.cend());
 
     const size_t own = names.size();
 
@@ -191,8 +321,9 @@ double EnergyModel::Value(const CounterValues& counters, const std::string& name
 
 double EnergyModel::Count(const CounterValues& counters, const std::string& name) const
 {
+    // Negative values count as 0 (energy_events.counter): CUPTI reports the L2 reduction counters negative now and then.
     const double value = Value(counters, name);
-    return std::isnan(value) ? 0.0 : value;
+    return std::isnan(value) || value < 0.0 ? 0.0 : value;
 }
 
 std::vector<std::string> EnergyModel::MissingCounters(const CounterValues& counters) const
@@ -311,16 +442,62 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
     };
 }
 
-EnergyPrediction EnergyModel::Predict(const CounterValues& counters, const double kernelS, const double temperatureC,
-    const double smClockMHz, const bool strict) const
+EnergyPrediction EnergyModel::Predict(const CounterValues& input, const double kernelS, const double temperatureC,
+    const double smClockMHz, const bool strict, const std::string& group) const
 {
-    if (!(kernelS > 0.0))
+    if (!(kernelS > 0.0) || std::isinf(kernelS))
     {
-        throw std::runtime_error("EnergyModel::Predict: the kernel's time must be positive");
+        throw std::runtime_error("EnergyModel::Predict: the kernel's time must be positive and finite");
     }
 
     EnergyPrediction prediction;
     prediction.kernelS = kernelS;
+    prediction.group = group;
+
+    // Negative counter values count as 0 with a warning (CUPTI reports some); values that are not finite are an error
+    // with strict, else the same.
+    CounterValues counters = input;
+    std::vector<std::string> negative;
+    std::vector<std::string> infinite;
+
+    for (const auto& name : Counters())
+    {
+        const auto found = counters.find(name);
+
+        if (found != counters.end() && (found->second < 0.0 || std::isinf(found->second)))
+        {
+            (std::isinf(found->second) ? infinite : negative).push_back(name);
+        }
+    }
+
+    if (!infinite.empty() && strict)
+    {
+        std::string text = "counter values that are not finite:";
+
+        for (const auto& name : infinite)
+        {
+            text += " " + name + " = " + ValueText(counters.at(name));
+        }
+
+        throw std::runtime_error(text);
+    }
+
+    if (!negative.empty() || !infinite.empty())
+    {
+        std::string text = "counter values that are negative or not finite count as 0:";
+
+        for (const auto* list : {&negative, &infinite})
+        {
+            for (const auto& name : *list)
+            {
+                text += " " + name + " = " + ValueText(counters.at(name));
+                counters[name] = 0.0;
+            }
+        }
+
+        prediction.warnings.push_back(text);
+    }
+
     const std::vector<std::string> missing = MissingCounters(counters);
 
     if (!missing.empty())
@@ -357,11 +534,14 @@ EnergyPrediction EnergyModel::Predict(const CounterValues& counters, const doubl
 
     prediction.events = Events(counters, kernelS);
     const double instructions = Count(counters, "smsp__inst_executed.sum");
+    const auto scaleEntry = m_KernelScales.find(group);
+    const double scale = scaleEntry != m_KernelScales.cend() ? scaleEntry->second.first : 1.0;
 
     for (size_t i = 0; i < prediction.events.size(); ++i)
     {
         const auto& [name, count] = prediction.events[i];
-        prediction.dynamicJ += count * m_Energies[i].second * 1e-12;
+        prediction.unscaledDynamicJ += count * m_Energies[i].second * 1e-12;
+        prediction.dynamicJ += count * m_Energies[i].second * 1e-12 * scale;
 
         if (count > 0.0 && std::find(m_Unpriced.cbegin(), m_Unpriced.cend(), name) != m_Unpriced.cend())
         {
@@ -385,8 +565,7 @@ EnergyPrediction EnergyModel::Predict(const CounterValues& counters, const doubl
             + std::to_string(std::lround(m_ClockMHz)) + " MHz: the prediction is only good for ranking");
     }
 
-    prediction.baselineJ = BaselineW(temperatureC) * kernelS;
-    prediction.energyJ = prediction.baselineJ + prediction.dynamicJ;
+    const double awakeJ = BaselineW(temperatureC) * kernelS;
     double baselineSd = m_BaselineSdW * kernelS;
 
     if (std::isnan(temperatureC))
@@ -394,18 +573,56 @@ EnergyPrediction EnergyModel::Predict(const CounterValues& counters, const doubl
         baselineSd = std::hypot(baselineSd, m_UnknownTemperatureSdW * kernelS);
     }
 
-    prediction.sdJ = std::hypot(m_RelativeSd * prediction.dynamicJ, baselineSd);
+    prediction.dynamicSdJ = m_RelativeSd * prediction.dynamicJ;
 
-    if (!std::isnan(m_PowerLimitW) && prediction.energyJ > m_PowerLimitW * kernelS)
+    if (!std::isnan(m_PowerLimitW) && awakeJ + prediction.dynamicJ > m_PowerLimitW * kernelS)
     {
-        prediction.warnings.push_back("predicted power " + std::to_string(std::lround(prediction.energyJ / kernelS))
+        prediction.warnings.push_back("predicted power " + std::to_string(std::lround((awakeJ + prediction.dynamicJ) / kernelS))
             + " W is above the GPU's limit of " + std::to_string(std::lround(m_PowerLimitW))
             + " W: the GPU will lower its clock; energy taken as the limit times the time");
-        prediction.energyJ = m_PowerLimitW * kernelS;
-        prediction.dynamicJ = std::max(prediction.energyJ - prediction.baselineJ, 0.0);
+        prediction.dynamicJ = std::max(m_PowerLimitW * kernelS - awakeJ, 0.0);
+        // The energy is the limit times the measured time: its uncertainty is how closely the GPU holds the limit.
+        prediction.dynamicSdJ = LimitRelativeSd * m_PowerLimitW * kernelS;
+        prediction.clamped = true;
     }
 
+    // The baseline under the accounting, and the weight with which its error enters the energy (energy_predictor.py).
+    const double subtract = m_Accounting == EnergyAccounting::Awake ? 0.0
+        : m_Accounting == EnergyAccounting::AboveIdle ? IdlePowerW() * kernelS : awakeJ;
+    prediction.baselineWeight = (prediction.clamped ? 0.0 : 1.0) - (m_Accounting == EnergyAccounting::Dynamic ? 1.0 : 0.0);
+    prediction.baselineJ = awakeJ - subtract;
+    prediction.energyJ = prediction.baselineJ + prediction.dynamicJ;
+    prediction.sdJ = std::hypot(prediction.dynamicSdJ, prediction.baselineWeight * baselineSd);
     return prediction;
+}
+
+double EnergyModel::IndependentSd(const EnergyPrediction& prediction, const EnergyPrediction& other) const
+{
+    if (prediction.clamped)
+    {
+        return prediction.dynamicSdJ;
+    }
+
+    if (prediction.group == other.group)
+    {
+        return m_RelativeSd * prediction.dynamicJ;
+    }
+
+    // Against another kernel the bias of this one adds: the spread between kernels, or for a kernel with a measured
+    // scale what is left of its bias, the scale's error from n measurements and the repeat of a measurement.
+    const auto scaled = m_KernelScales.find(prediction.group);
+    const double bias = scaled == m_KernelScales.cend() ? BetweenKernelsSd()
+        : std::hypot(m_RelativeSd / std::sqrt(static_cast<double>(scaled->second.second)), ScaleRunSd);
+    return std::hypot(m_RelativeSd, bias) * prediction.dynamicJ;
+}
+
+double EnergyModel::PairSd(const EnergyPrediction& a, const EnergyPrediction& b, const double scaleA, const double scaleB) const
+{
+    // The independent parts add in quadrature; a baseline error is common to both and acts on the difference of their
+    // times, weighted by how the baseline enters each energy.
+    const double baselineSd = std::hypot(m_BaselineSdW, m_UnknownTemperatureSdW);
+    return std::sqrt(std::pow(IndependentSd(a, b) * scaleA, 2) + std::pow(IndependentSd(b, a) * scaleB, 2)
+        + std::pow(baselineSd * (a.baselineWeight * a.kernelS * scaleA - b.baselineWeight * b.kernelS * scaleB), 2));
 }
 
 double ObjectiveValue(const EnergyPrediction& prediction, const EnergyObjective objective)
@@ -442,14 +659,19 @@ EnergyRecommendation EnergyModel::Recommend(const std::vector<EnergyPrediction>&
 
     EnergyRecommendation result;
     result.values.assign(predictions.size(), NotANumber);
+    size_t byTime = 0;
+    size_t byEnergy = 0;
     bool any = false;
 
     for (size_t i = 0; i < predictions.size(); ++i)
     {
         const auto& p = predictions[i];
+        const bool timeOk = std::isnan(maxSlowdown) || p.kernelS <= fastest * (1.0 + maxSlowdown);
+        const bool energyOk = std::isnan(maxEnergyIncrease) || p.energyJ <= cheapest * (1.0 + maxEnergyIncrease);
+        byTime += timeOk;
+        byEnergy += energyOk;
 
-        if ((std::isnan(maxSlowdown) || p.kernelS <= fastest * (1.0 + maxSlowdown))
-            && (std::isnan(maxEnergyIncrease) || p.energyJ <= cheapest * (1.0 + maxEnergyIncrease)))
+        if (timeOk && energyOk)
         {
             result.values[i] = ObjectiveValue(p, objective);
 
@@ -461,12 +683,18 @@ EnergyRecommendation EnergyModel::Recommend(const std::vector<EnergyPrediction>&
         }
     }
 
+    if (!any)
+    {
+        throw std::runtime_error("no configuration is admissible: the slowdown limit admits " + std::to_string(byTime)
+            + " of " + std::to_string(predictions.size()) + ", the energy-increase limit " + std::to_string(byEnergy)
+            + ", and none is in both");
+    }
+
     if (objective == EnergyObjective::Time)
     {
         return result;
     }
 
-    const double baselineSd = std::hypot(m_BaselineSdW, m_UnknownTemperatureSdW);
     const auto& best = predictions[result.index];
     const double scaleBest = result.values[result.index] / best.energyJ;
 
@@ -477,12 +705,8 @@ EnergyRecommendation EnergyModel::Recommend(const std::vector<EnergyPrediction>&
             continue;
         }
 
-        // The dynamic errors of two configurations are independent; a baseline error is common to both and acts on the
-        // difference of their times.
         const auto& p = predictions[i];
-        const double scale = result.values[i] / p.energyJ;
-        const double sd = std::sqrt(std::pow(m_RelativeSd * p.dynamicJ * scale, 2) + std::pow(m_RelativeSd * best.dynamicJ * scaleBest, 2)
-            + std::pow(baselineSd * (p.kernelS * scale - best.kernelS * scaleBest), 2));
+        const double sd = PairSd(p, best, result.values[i] / p.energyJ, scaleBest);
 
         if (result.values[i] - result.values[result.index] <= z * sd)
         {

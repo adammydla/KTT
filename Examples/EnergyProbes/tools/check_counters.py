@@ -89,6 +89,8 @@ def classify(name, available, compute_capability):
         return "covered", f"this GPU has {base(alternative)} instead (this one exists on {entry.get('exists', '?')})"
     if not counter_table.applicable(name, compute_capability):
         return "not applicable", f"exists from compute capability {entry['min_cc']}: {entry.get('exists', '')}"
+    if entry.get("study"):
+        return "option", f"screening counter, only --study-counters collects it ({entry.get('use', '')})"
     if "only_with" in entry:
         return "option", f"only {entry['only_with']} uses it ({entry.get('exists', '')})"
     if "feeds" not in entry:

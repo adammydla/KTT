@@ -32,6 +32,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--power", required=True, help="probe power runs, comma-separated (as for energy_model.py)")
     parser.add_argument("--counters", required=True, help="profiled probe runs, comma-separated")
+    parser.add_argument("--full-rate", help="runs made at one duty, comma-separated, as in energy_model.py")
+    parser.add_argument("--sm-sweep", help="runs with --latency --sm-sweep, comma-separated, as in energy_model.py")
     parser.add_argument("--validation", required=True, help="validation runs, comma-separated")
     parser.add_argument("--weighted", action="store_true", help="as in energy_model.py")
     parser.add_argument("--fma-halves", action="store_true", help="as in energy_model.py")
@@ -43,7 +45,9 @@ def main():
     selected = set(arguments.kernels.split(",")) if arguments.kernels else None
 
     with contextlib.redirect_stdout(io.StringIO()):
-        probes, table = m.probe_table(arguments.power.split(","), arguments.counters.split(","))
+        probes, table = m.probe_table(arguments.power.split(","), arguments.counters.split(","),
+                                      arguments.full_rate.split(",") if arguments.full_rate else (),
+                                      arguments.sm_sweep.split(",") if arguments.sm_sweep else ())
     if any(p.label == "compute ffma3" for p in probes):
         probes = [p for p in probes if p.label not in m.TWO_REGISTER_FFMA]
     probes = [p for p in probes if p.label not in m.CHECK_ONLY]

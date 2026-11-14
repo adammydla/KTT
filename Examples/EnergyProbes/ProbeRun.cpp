@@ -46,6 +46,11 @@ struct ProbeRunKernels
     std::optional<ktt::KernelId> partial;
     std::optional<ktt::KernelId> banks;
     std::optional<ktt::KernelId> indexing;
+    std::optional<ktt::KernelId> lanes; // --lanes
+    std::optional<ktt::KernelId> misaligned; // --misaligned
+    std::optional<ktt::KernelId> writePath;  // --write-path
+    std::optional<ktt::KernelId> l1Sweep;    // --l1-sweep
+    std::optional<ktt::KernelId> classes;    // --instr-classes
     std::optional<ktt::KernelId> mixed;
     std::optional<ktt::KernelId> write;
     std::optional<ktt::KernelId> latency;
@@ -152,7 +157,7 @@ void CreateGroupKernels(GpuSession& session, const ProbeDefinitions& definitions
 
     // Sub-sector accesses: 4- and 8-byte loads and stores at the DRAM footprint with the sectors of a warp adjacent or
     // scattered, and scattered at the L2 footprint.
-    if (definitions.partial.has_value())
+    if (options.subSector)
     {
         kernels.partial = session.CreateKernel("Partial", definitions.partial.value(), settings.partial, false, counts);
         tuner.AddParameter(kernels.partial.value(), "LOAD_OP", std::vector<uint64_t>{LoadDefault, StoreDefault});
@@ -195,6 +200,70 @@ void CreateGroupKernels(GpuSession& session, const ProbeDefinitions& definitions
         tuner.AddParameter(kernels.indexing.value(), "PAYLOAD", options.payloads);
     }
 
+    // --instr-classes: the instruction classes inside one event, at every duty.
+    if (options.instrClasses)
+    {
+        kernels.classes = session.CreateKernel("Classes", definitions.compute, settings.compute, false, counts);
+        tuner.AddParameter(kernels.classes.value(), "COMPUTE_OP", InstructionClassOps);
+        tuner.AddParameter(kernels.classes.value(), "DUTY", options.duties);
+        tuner.AddParameter(kernels.classes.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+    }
+
+    // --write-path: 4-byte loads and stores of 1, 2, 4 or 8 words of a sector, with 1, 2 or 4 sectors per L2 request, at
+    // the L2 and DRAM footprints (probePartial), random data, every duty.
+    // --l1-sweep: L1 loads and stores with 1-32 sectors in 1, 4 or 32 lines per warp instruction (sectors between the
+    // lines and four times the lines), 4- and 16-byte words, every duty.
+    if (options.l1Sweep)
+    {
+        kernels.l1Sweep = session.CreateKernel("L1Sweep", definitions.l1Sweep.value(), settings.l1Sweep, false, counts);
+        tuner.AddParameter(kernels.l1Sweep.value(), "LOAD_OP", std::vector<uint64_t>{LoadDefault, StoreDefault});
+        tuner.AddParameter(kernels.l1Sweep.value(), "FOOTPRINT", std::vector<uint64_t>{footprints.l1});
+        tuner.AddParameter(kernels.l1Sweep.value(), "WIDTH", std::vector<uint64_t>{4, 16});
+        tuner.AddParameter(kernels.l1Sweep.value(), "SWEEP_SECTORS", std::vector<uint64_t>{1, 2, 4, 8, 16, 32});
+        tuner.AddParameter(kernels.l1Sweep.value(), "SWEEP_LINES", std::vector<uint64_t>{1, 4, 32});
+        tuner.AddConstraint(kernels.l1Sweep.value(), {"SWEEP_SECTORS", "SWEEP_LINES"}, [](const std::vector<uint64_t>& v)
+            { return v[1] <= v[0] && v[0] <= 4 * v[1]; });
+        tuner.AddParameter(kernels.l1Sweep.value(), "DUTY", options.duties);
+        tuner.AddParameter(kernels.l1Sweep.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+    }
+
+    if (options.writePath)
+    {
+        kernels.writePath = session.CreateKernel("WritePath", definitions.partial.value(), settings.partial, false, counts);
+        tuner.AddParameter(kernels.writePath.value(), "LOAD_OP", std::vector<uint64_t>{LoadDefault, StoreDefault});
+        tuner.AddParameter(kernels.writePath.value(), "FOOTPRINT", std::vector<uint64_t>{footprints.l2, footprints.dram});
+        tuner.AddParameter(kernels.writePath.value(), "WIDTH", std::vector<uint64_t>{4});
+        tuner.AddParameter(kernels.writePath.value(), "SPREAD", std::vector<uint64_t>{0, 2, 1});
+        tuner.AddParameter(kernels.writePath.value(), "PARTIAL_WORDS", std::vector<uint64_t>{1, 2, 4, 8});
+        tuner.AddParameter(kernels.writePath.value(), "DUTY", options.duties);
+        tuner.AddParameter(kernels.writePath.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+    }
+
+    // --misaligned: the stream load and store with their start off the line (probeGlobal on views of the payload).
+    if (options.misaligned)
+    {
+        const Plan streams = {{LoadDefault, footprints.l1, 4}, {LoadDefault, footprints.l1, 16}, {LoadDefault, footprints.l2, 4},
+            {LoadDefault, footprints.l2, 16}, {LoadDefault, footprints.dram, 4}, {LoadDefault, footprints.dram, 16},
+            {StoreDefault, footprints.l2, 4}, {StoreDefault, footprints.l2, 16}, {StoreDefault, footprints.dram, 4},
+            {StoreDefault, footprints.dram, 16}};
+        kernels.misaligned = session.CreateKernel("Misaligned", definitions.global, settings.global, true, counts);
+        AddGlobalParameters(tuner, kernels.misaligned.value(), streams, footprints);
+        tuner.AddParameter(kernels.misaligned.value(), "OFFSET_BYTES", MisalignedOffsets);
+        tuner.AddParameter(kernels.misaligned.value(), "DUTY", options.duties);
+        tuner.AddParameter(kernels.misaligned.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+    }
+
+    // --lanes: FFMA and IADD with some of the 32 lanes active, by predicate and by branch, at every duty.
+    if (options.lanes)
+    {
+        kernels.lanes = session.CreateKernel("Lanes", definitions.compute, settings.compute, false, counts);
+        tuner.AddParameter(kernels.lanes.value(), "COMPUTE_OP", std::vector<uint64_t>{ComputeFfmaLanes,
+            ComputeFfmaLanesBranch, ComputeIaddLanes, ComputeIaddLanesBranch, ComputeFfmaLanesRotating});
+        tuner.AddParameter(kernels.lanes.value(), "LANES", LaneCounts);
+        tuner.AddParameter(kernels.lanes.value(), "DUTY", options.duties);
+        tuner.AddParameter(kernels.lanes.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+    }
+
     // Mixed intensity: the 16-byte loads at the three footprints with 0 to 1024 FFMAs per load, on random data at full rate
     // only (with the per-warp sleeps of a lower duty, the other warps would fill the FFMA pipeline; see IdleForDutyWindow).
     if (definitions.mixed.has_value())
@@ -205,6 +274,23 @@ void CreateGroupKernels(GpuSession& session, const ProbeDefinitions& definitions
         tuner.AddParameter(kernels.mixed.value(), "WIDTH", std::vector<uint64_t>{DefaultWidth});
         tuner.AddParameter(kernels.mixed.value(), "GRID_STRIPES", std::vector<uint64_t>{footprints.gridStripes});
         tuner.AddParameter(kernels.mixed.value(), "MIX_FMAS", MixedFmas);
+        // MIX_OP 0: FFMAs (--mixed, every count and footprint); 1: integer work (--mixed-int, 0-16 per load at L1, L2).
+        std::vector<uint64_t> mixOps;
+
+        if (options.mixed)
+        {
+            mixOps.push_back(0);
+        }
+
+        if (options.mixedInt)
+        {
+            mixOps.push_back(1);
+        }
+
+        tuner.AddParameter(kernels.mixed.value(), "MIX_OP", mixOps);
+        const uint64_t dram = footprints.dram;
+        tuner.AddConstraint(kernels.mixed.value(), {"MIX_OP", "MIX_FMAS", "FOOTPRINT"}, [dram](const std::vector<uint64_t>& v)
+            { return v[0] == 0 || (v[1] <= 16 && v[2] != dram); });
         tuner.AddParameter(kernels.mixed.value(), "DUTY", std::vector<uint64_t>{100});
         tuner.AddParameter(kernels.mixed.value(), "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
     }
@@ -382,6 +468,11 @@ std::vector<GroupRun> GroupRuns(const ProbeRunKernels& kernels)
         {kernels.scatter, {0, "scatter", "locality", ""}},
         {kernels.partial, {0, "partial", "sub-sector", ""}},
         {kernels.indexing, {0, "indexing", "indexing", ""}},
+        {kernels.lanes, {0, "lanes", "lanes", ""}},
+        {kernels.misaligned, {0, "misaligned", "misaligned", ""}},
+        {kernels.writePath, {0, "write_path", "write path", ""}},
+        {kernels.l1Sweep, {0, "l1_sweep", "L1 sweep", ""}},
+        {kernels.classes, {0, "classes", "instruction classes", ""}},
         {kernels.mixed, {0, "mixed", "mixed", ""}},
         {kernels.write, {0, "write", "write", ""}},
         {kernels.patternLoads, {0, "pattern_loads", "payload-bits", ""}},
@@ -496,7 +587,7 @@ int RunProbes(const Options& options)
         try
         {
             tuner.SetProfiling(true);
-            tuner.SetProfilingCounters(ModelCounters(options.counterTable));
+            tuner.SetProfilingCounters(ModelCounters(options.counterTable, options.studyCounters));
         }
         catch (const ktt::KttException& error)
         {
@@ -536,7 +627,7 @@ int RunProbes(const Options& options)
     std::cout << "\nWrote " << options.outputPrefix << ".csv, " << options.outputPrefix << "_fits.csv, " << options.outputPrefix
         << "_energy_table.json, " << options.outputPrefix << "_*.json (raw KTT results)"
         << (session.GetMonitor() != nullptr ? " and " + options.outputPrefix + "_trace.csv (NVML trace)" : "") << "\n"
-        << "These are prototype numbers: see README.md for what they include and how to validate them.\n";
+        << "These are prototype numbers: see docs/CALIBRATION.md for what they include and how to validate them.\n";
     return 0;
 }
 
@@ -612,3 +703,119 @@ int RunThermalCurve(const Options& options)
     return 0;
 }
 
+
+// NEXT_STEPS_PLAN M1: does the power of a working GPU rise with the temperature faster than the sleep baseline does, and
+// does that depend on the duty or on the dynamic power? Five probes that span the power range (the loop alone, FFMA with
+// three registers, 16-byte L2 loads, DRAM loads, DRAM stores) at every --duty, and the sleep baseline, each held
+// --thermal-hold seconds twice: once after 60 s of sleep (starting cool) and once after 60 s of DRAM stores at duty 100
+// (starting hot), so that the temperature runs through the same range up and down and a drift in time can be told from
+// the temperature. Every phase is a kernel of its own (the trace names the kernel); tools/fit_thermal_load.py fits it.
+int RunThermalLoad(const Options& options)
+{
+    GpuSession session(options);
+    session.OpenMonitor();
+
+    ktt::Tuner& tuner = session.GetTuner();
+    std::vector<uint32_t> payload = RandomPayload(session.GetFootprints().dram);
+    const ProbeArguments arguments = AddProbeArguments(tuner, payload, options, session.GetBlocks());
+    const ProbeDefinitions definitions = AddProbeDefinitions(tuner, arguments, options,
+        session.GetHardware().multiprocessors);
+    const ProbeTextures textures = CreateProbeTextures(payload, options);
+    const ProbeSettings settings = MakeProbeSettings(arguments, definitions, session.GetFootprints(), textures);
+    const Footprints& footprints = session.GetFootprints();
+
+    struct Probe
+    {
+        std::string name;
+        bool compute;
+        uint64_t op;
+        uint64_t footprint;
+    };
+
+    const std::vector<Probe> probes = {{"loop", true, ComputeLoop, 0}, {"ffma3", true, ComputeFfma3, 0},
+        {"L2ld", false, LoadDefault, footprints.l2}, {"DRAMld", false, LoadDefault, footprints.dram},
+        {"DRAMst", false, StoreDefault, footprints.dram}};
+
+    auto global = [&](const std::string& name, const uint64_t op, const uint64_t footprint, const uint64_t duty)
+    {
+        const ktt::KernelId kernel = session.CreateKernel(name, definitions.global, settings.global, true, arguments.counts);
+        AddGlobalParameters(tuner, kernel, Plan{{op, footprint, 16}}, footprints);
+        tuner.AddParameter(kernel, "DUTY", std::vector<uint64_t>{duty});
+        tuner.AddParameter(kernel, "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+        return kernel;
+    };
+    auto compute = [&](const std::string& name, const uint64_t op, const uint64_t duty)
+    {
+        const ktt::KernelId kernel = session.CreateKernel(name, definitions.compute, settings.compute, false, arguments.counts);
+        tuner.AddParameter(kernel, "COMPUTE_OP", std::vector<uint64_t>{op});
+        tuner.AddParameter(kernel, "DUTY", std::vector<uint64_t>{duty});
+        tuner.AddParameter(kernel, "PAYLOAD", std::vector<uint64_t>{PayloadRandom});
+        return kernel;
+    };
+    auto sleeper = [&](const std::string& name)
+    {
+        return session.CreateKernel(name, definitions.sleep, settings.common, false, arguments.counts);
+    };
+
+    // KTT needs every kernel before the first one runs.
+    struct Phase
+    {
+        ktt::KernelId preparation;
+        ktt::KernelId hold;
+        std::string name;
+        std::string operation;
+        std::string level;
+    };
+
+    std::vector<Phase> phases;
+
+    for (const char* start : {"cool", "hot"})
+    {
+        const bool hot = std::string(start) == "hot";
+        auto preparation = [&](const std::string& name)
+        {
+            return hot ? global("Prep_" + name, StoreDefault, footprints.dram, 100) : sleeper("Prep_" + name);
+        };
+        const std::string sleepName = std::string("Hold_sleep_") + start;
+        phases.push_back({preparation(sleepName), sleeper(sleepName), sleepName, "sleep", "baseline"});
+
+        for (const auto& probe : probes)
+        {
+            for (const uint64_t duty : options.duties)
+            {
+                const std::string name = "Hold_" + probe.name + "_d" + std::to_string(duty) + "_" + start;
+                const ktt::KernelId hold = probe.compute ? compute(name, probe.op, duty)
+                    : global(name, probe.op, probe.footprint, duty);
+                phases.push_back({preparation(name), hold, name, probe.name, "d" + std::to_string(duty)});
+            }
+        }
+    }
+
+    // Cool starts and hot starts alternate, so that a slow drift over the run is not mistaken for the start.
+    std::vector<Phase> order;
+    const size_t half = phases.size() / 2;
+
+    for (size_t i = 0; i < half; ++i)
+    {
+        order.push_back(phases[i]);
+        order.push_back(phases[half + i]);
+    }
+
+    std::cout << "Thermal load: " << order.size() << " phases of 60 s preparation + " << options.thermalHoldS
+        << " s hold, traced every " << options.traceIntervalMs << " ms; about "
+        << (order.size() * (60 + options.thermalHoldS) + 120) / 60 << " min.\n";
+    session.MeasureIdle("idle-start");
+
+    for (const auto& phase : order)
+    {
+        session.RunFor(phase.preparation, 60, "prep_" + phase.name, "prep", "", "");
+        session.RunFor(phase.hold, options.thermalHoldS, phase.name, phase.name, phase.operation, phase.level);
+    }
+
+    session.MeasureIdle("idle-end");
+    session.WriteTrace();
+    WriteCsv(session.GetRows(), options.outputPrefix + ".csv");
+    std::cout << "\nWrote " << options.outputPrefix << ".csv and " << options.outputPrefix << "_trace.csv; fit them with "
+        << "tools/fit_thermal_load.py " << options.outputPrefix << "\n";
+    return 0;
+}

@@ -45,6 +45,7 @@ using ValidationStatsMap = std::map<std::string, ValidationStats>;
 struct ValidationRow
 {
     std::string kernel;
+    uint64_t repeat = 0; // --validate-repeat: which power measurement of the configuration
     ktt::KernelConfiguration configuration;
     bool valid = false;
     uint64_t launches = 0;
@@ -95,7 +96,7 @@ void WriteValidationCsv(const std::vector<ValidationRow>& rows, const BaselineMo
     std::ofstream output(file);
     output << "kernel,configuration,valid,launches,accesses_per_launch,wall_s,kernel_s,busy,power_w,instant_power_w,counter_power_w,sm_clock_mhz,"
         << "memory_clock_mhz,temperature_c,fan_pct,clock_limiters,baseline_w,baseline_mean_w,baseline_temperature_c,"
-        << "baseline_slope_w_per_c,dynamic_energy_j,energy_j,note";
+        << "baseline_slope_w_per_c,dynamic_energy_j,energy_j,repeat,note";
 
     for (const auto& name : counterNames)
     {
@@ -112,7 +113,7 @@ void WriteValidationCsv(const std::vector<ValidationRow>& rows, const BaselineMo
             << CsvValue(row.smClockMHz) << "," << CsvValue(row.memoryClockMHz) << "," << CsvValue(row.temperatureC) << ","
             << CsvValue(row.fanPct) << "," << CsvText(row.limiters) << "," << CsvValue(row.baselineW) << "," << CsvValue(baseline.meanW) << ","
             << CsvValue(baseline.meanTemperatureC) << "," << CsvValue(baseline.temperatureModel ? baseline.slopeWPerC : 0.0)
-            << "," << CsvValue(row.dynamicJ) << "," << CsvValue(row.energyJ) << "," << CsvText(row.note);
+            << "," << CsvValue(row.dynamicJ) << "," << CsvValue(row.energyJ) << "," << row.repeat << "," << CsvText(row.note);
 
         for (const auto& name : counterNames)
         {
@@ -272,11 +273,12 @@ int FinishValidation(ktt::Tuner& tuner, const std::vector<ValidationKernel>& ker
 
     if (tuner.GetProfiling())
     {
-        tuner.SetProfilingCounters(ModelCounters(options.counterTable));
+        tuner.SetProfilingCounters(ModelCounters(options.counterTable, options.studyCounters));
 
         for (auto& row : rows)
         {
-            if (!row.valid)
+            // A configuration's counters do not change between its power measurements: collected once.
+            if (!row.valid || row.repeat > 0)
             {
                 continue;
             }
@@ -310,6 +312,25 @@ int FinishValidation(ktt::Tuner& tuner, const std::vector<ValidationKernel>& ker
         }
 
         tuner.SetCompilerOptions("");
+
+        for (auto& row : rows)
+        {
+            if (row.repeat == 0)
+            {
+                continue;
+            }
+
+            const auto first = std::find_if(rows.cbegin(), rows.cend(), [&row](const ValidationRow& other)
+            {
+                return other.repeat == 0 && other.kernel == row.kernel
+                    && other.configuration.GetString() == row.configuration.GetString();
+            });
+
+            if (first != rows.cend())
+            {
+                row.counters = first->counters;
+            }
+        }
     }
     else
     {
@@ -455,11 +476,14 @@ int RunValidation(const Options& options)
     const BaselineKernels baselines = AddBaselineKernels(tuner, options, session.GetBlocks(),
         session.GetHardware().multiprocessors);
     const ktt::KernelId warmup = session.CreateKernel("Warmup", baselines.spin, Configure{}, false, baselines.counts);
-    // A baseline before the first example kernel and one after every one.
-    SleepBaselines sleeps(session, baselines.sleep, baselines.configure, baselines.counts, options.validate.size() + 1);
+    // A baseline before the first example kernel and one after every one (in every round of --validate-repeat).
+    SleepBaselines sleeps(session, baselines.sleep, baselines.configure, baselines.counts,
+        options.validate.size() * options.validateRepeat + 1);
     std::vector<ValidationKernel> kernels;
     ValidationStatsMap stats;
     std::vector<uint32_t> payload; // the control kernel's data; KTT keeps a reference to it
+
+    SetValidationInputs({options.validateData, options.validateSizeScale, options.accelwattchDirectory});
 
     for (const auto& name : options.validate)
     {
@@ -479,7 +503,15 @@ int RunValidation(const Options& options)
     {
         std::cout << "\n=== Validation kernel " << kernel.name << " ===" << std::endl;
         tuner.SetCompilerOptions(kernel.compilerOptions);
-        tuner.SetSearcher(kernel.kernel, std::make_unique<ktt::RandomSearcher>());
+        if (options.validateSeed.has_value())
+        {
+            tuner.SetSearcher(kernel.kernel, std::make_unique<SeededSearcher>(options.validateSeed.value()));
+        }
+        else
+        {
+            tuner.SetSearcher(kernel.kernel, std::make_unique<ktt::RandomSearcher>());
+        }
+
         const auto results = tuner.Tune(kernel.kernel, std::make_unique<ktt::ConfigurationCount>(options.validateConfigs));
         tuner.SaveResults(results, options.outputPrefix + "_" + kernel.name, ktt::OutputFormat::JSON);
         tuner.SetCompilerOptions("");
@@ -490,6 +522,34 @@ int RunValidation(const Options& options)
         }
 
         sleeps.RunNext();
+    }
+
+    // --validate-repeat: the same configurations again, in rounds over all kernels, so that a configuration's repeats are
+    // spread over the run (its drift shows as a difference between the first and the last round).
+    const size_t firstRound = validationRows.size();
+
+    for (uint64_t repeat = 1; repeat < options.validateRepeat; ++repeat)
+    {
+        for (const auto& kernel : kernels)
+        {
+            std::cout << "\n=== Validation kernel " << kernel.name << ", repeat " << repeat << " ===" << std::endl;
+            tuner.SetCompilerOptions(kernel.compilerOptions);
+
+            for (size_t i = 0; i < firstRound; ++i)
+            {
+                if (validationRows[i].kernel != kernel.name || !validationRows[i].valid)
+                {
+                    continue;
+                }
+
+                const ktt::KernelResult result = tuner.Run(kernel.kernel, validationRows[i].configuration, {});
+                validationRows.push_back(MakeValidationRow(result, kernel, stats));
+                validationRows.back().repeat = repeat;
+            }
+
+            tuner.SetCompilerOptions("");
+            sleeps.RunNext();
+        }
     }
 
     session.MeasureIdle("idle-end");

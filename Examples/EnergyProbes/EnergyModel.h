@@ -19,6 +19,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <json.hpp>
 
 using CounterValues = std::map<std::string, double>;
 
@@ -32,6 +33,19 @@ struct EnergyPrediction
     double kernelS = 0.0;
     std::vector<std::pair<std::string, double>> events; // event counts, in the model's order
     std::vector<std::string> warnings;
+    double dynamicSdJ = 0.0;    // the part of sdJ that is independent between configurations
+    double baselineWeight = 1.0; // how the baseline's error enters energyJ (1, 0, or -1 at the limit under Dynamic)
+    bool clamped = false;       // the power limit applied: energyJ is the limit times the time
+    std::string group;          // the kernel: Recommend() compares predictions of different groups with a wider sd
+    double unscaledDynamicJ = 0.0; // dynamicJ before the kernel's scale and the power limit (KernelScale reads it)
+};
+
+// Which baseline goes into the energy (energy_predictor.py ACCOUNTINGS).
+enum class EnergyAccounting
+{
+    Awake,     // the GPU awake at the model's clock over the kernel's time (kernels back to back)
+    AboveIdle, // only what the kernel costs above an idle GPU with a CUDA context (work once per period)
+    Dynamic    // no baseline
 };
 
 enum class EnergyObjective
@@ -64,6 +78,16 @@ public:
     // Predict() takes that value and adds a warning. NaN (the default) = no limit known.
     void SetPowerLimitW(const double watts) { m_PowerLimitW = watts; }
 
+    // Which baseline the energy includes, and the idle power for AboveIdle (NaN = the file's idle power with a context;
+    // Predict() throws if neither is known).
+    void SetAccounting(const EnergyAccounting accounting, const double idleW = std::numeric_limits<double>::quiet_NaN())
+    {
+        m_Accounting = accounting;
+        m_IdleW = idleW;
+    }
+    EnergyAccounting Accounting() const { return m_Accounting; }
+    double IdlePowerW() const; // the power AboveIdle subtracts
+
     // The CUPTI counters to collect: every counter the model needs, under all its names on other chips (KTT skips the
     // ones a GPU lacks).
     std::vector<std::string> Counters() const;
@@ -78,22 +102,44 @@ public:
     std::vector<std::pair<std::string, double>> Events(const CounterValues& counters, double kernelS) const;
 
     // Energy of one launch. temperatureC and smClockMHz: NaN = unknown. With strict, counters the model needs and does not
-    // find throw std::runtime_error (they would count as 0); without, they become a warning.
+    // find, and counter values that are not finite, throw std::runtime_error (missing ones would count as 0); without,
+    // they become a warning. Negative values always count as 0 with a warning (CUPTI reports some). group: the kernel.
     EnergyPrediction Predict(const CounterValues& counters, double kernelS,
         double temperatureC = std::numeric_limits<double>::quiet_NaN(),
-        double smClockMHz = std::numeric_limits<double>::quiet_NaN(), bool strict = true) const;
+        double smClockMHz = std::numeric_limits<double>::quiet_NaN(), bool strict = true,
+        const std::string& group = "") const;
+
+    // The relative sd of the model's bias between kernels (the within-kernel sd if the file has none).
+    double BetweenKernelsSd() const;
+
+    // A kernel's measured scale: the mean of measured / predicted dynamic energy over at least `minimum` configurations
+    // measured with NVML, from the predictions' unscaled dynamic energy (so a second call cannot compound a scale).
+    // Sets it for the group with the number of measurements and returns it; NaN (nothing set) with fewer. Predict()
+    // multiplies the group's dynamic energy by it, and against other kernels Recommend() widens the group's sd by what is
+    // left of its bias: hypot(relative sd / sqrt(n), ScaleRunSd) instead of the spread of the bias between kernels.
+    double KernelScale(const std::string& group, const std::vector<EnergyPrediction>& predictions,
+        const std::vector<double>& measuredDynamicJ, size_t minimum = 3);
+
+    // The repeatability of a measured energy between runs (2.4 % on the RTX 3090): part of a kernel scale's error.
+    static constexpr double ScaleRunSd = 0.024;
+
+    // Standard deviation of objective(a) - objective(b), objective = scale x energy (energy_predictor.py pair_sd).
+    double PairSd(const EnergyPrediction& a, const EnergyPrediction& b, double scaleA = 1.0, double scaleB = 1.0) const;
 
     // The configuration to use. maxSlowdown: only configurations at most this fraction slower than the fastest (NaN = all);
-    // maxEnergyIncrease: the same against the lowest predicted energy. z: configurations within z standard deviations of
-    // the best are contenders (measure them if the difference matters).
+    // maxEnergyIncrease: the same against the lowest predicted energy; both are taken against all configurations, and
+    // std::runtime_error says what each left when no configuration meets both. z: configurations within z standard
+    // deviations of the best are contenders (measure them if the difference matters).
     EnergyRecommendation Recommend(const std::vector<EnergyPrediction>& predictions,
         EnergyObjective objective = EnergyObjective::Energy, double z = 2.0,
         double maxSlowdown = std::numeric_limits<double>::quiet_NaN(),
         double maxEnergyIncrease = std::numeric_limits<double>::quiet_NaN()) const;
 
 private:
+    void Load(const nlohmann::json& root);
     double Value(const CounterValues& counters, const std::string& name) const; // NaN if absent, aliases resolved
-    double Count(const CounterValues& counters, const std::string& name) const; // 0 if absent
+    double Count(const CounterValues& counters, const std::string& name) const; // 0 if absent or negative
+    double IndependentSd(const EnergyPrediction& prediction, const EnergyPrediction& other) const;
 
     std::string m_Device;
     double m_ClockMHz = std::numeric_limits<double>::quiet_NaN();
@@ -114,6 +160,16 @@ private:
     double m_BaselineSdW = 0.0;
     double m_UnknownTemperatureSdW = 0.0;
     double m_PowerLimitW = std::numeric_limits<double>::quiet_NaN();
+    double m_BetweenKernelsSd = std::numeric_limits<double>::quiet_NaN();
+    std::map<std::string, std::pair<double, size_t>> m_KernelScales; // scale and number of measurements
+    double m_ContextIdleW = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::string> m_Optional; // optional counters (lane counts, fp16 pipe, fma halves)
+    std::string m_File;
+    EnergyAccounting m_Accounting = EnergyAccounting::Awake;
+    double m_IdleW = std::numeric_limits<double>::quiet_NaN();
 };
+
+// "awake", "above-idle" or "dynamic"; throws for another name.
+EnergyAccounting AccountingOf(const std::string& name);
 
 double ObjectiveValue(const EnergyPrediction& prediction, EnergyObjective objective);

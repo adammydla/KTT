@@ -124,24 +124,41 @@ def family(level, operation):
 Probe = collections.namedtuple("Probe", "label energy counts family groups")
 
 
-def probe_table(power_prefixes, counters_prefixes):
+def probe_table(power_prefixes, counters_prefixes, full_rate_prefixes=(), sweep_prefixes=()):
     """The probes with random data on all SMs (Probe tuples). With several power runs, a probe's energy is the mean over
     the runs that have it; the baseline slope is the mean of their slopes. With several counter runs, a probe's counts
-    come from the first run that has it."""
+    come from the first run that has it.
+
+    full_rate_prefixes: runs made at one duty (e.g. --duty 100 only: --lanes, --instr-classes, --misaligned,
+    --write-path), whose probes have no fit over duties. Their probes enter with the energy of their duty-100 row, which
+    includes power that does not scale with the rate; only probes that no fit of the other runs gives come in this way,
+    and the number is printed. A --power run that contributes no probe gets a warning (its probes may need this).
+
+    sweep_prefixes: runs with --latency --sm-sweep (LowRate, LowRate30s): their dependent-load rows on fewer SMs enter
+    as probes of their own (energy of the duty-100 row averaged over the runs, counts from the counter run's row on the
+    same SMs, the time per access of the power rows), so that the DRAM busy price rests on the whole rate range (1-900
+    GB/s), not only on the latency probes on all SMs (NEXT_STEPS_PLAN P5). Family: the latency family + " (SM sweep)"."""
     tables = []
     collected = {}
     times = {}  # nanoseconds per access at duty 100, per probe
-    for prefix in power_prefixes:
-        with open(prefix + "_energy_table.json") as file:
-            table = json.load(file)
-        tables.append(table)
+    full_rate_only = set(full_rate_prefixes) - set(power_prefixes)
+    for prefix in list(power_prefixes) + [p for p in full_rate_prefixes if p in full_rate_only]:
+        try:
+            with open(prefix + "_energy_table.json") as file:
+                table = json.load(file)
+        except FileNotFoundError:
+            if prefix not in full_rate_prefixes:
+                raise
+            table = None
+        if table is not None:
+            tables.append(table)
         full_rate = {(r["level"], r["operation"], int(r["width_bytes"])): r for r in read_rows(prefix + ".csv")
                      if r["payload"] == "random" and r["active_sms"] == "all" and r["duty_pct"] == "100"}
         for key, row in full_rate.items():
             if number(row["accesses_per_launch"]) > 0 and number(row["active_s"]) > 0:
                 times.setdefault(key, []).append(number(row["active_s"]) / number(row["accesses_per_launch"]) * 1e9)
         run = {}
-        for fit in table["fits"]:
+        for fit in (table["fits"] if table is not None else []):
             if fit["payload"] == "random" and fit["pj_per_access"] is not None:
                 key = (fit["level"], fit["operation"], int(fit["width_bytes"]))
                 energy = float(fit["pj_per_access"])
@@ -165,7 +182,18 @@ def probe_table(power_prefixes, counters_prefixes):
         loop, two, three = (("compute", name, 0) for name in ("ffma-loop", "ffma", "ffma3"))
         if loop in run and two in run and three in run:
             run[loop] += run[three] - run[two]
+        if prefix in full_rate_prefixes:
+            added = 0
+            for key, row in full_rate.items():
+                if key not in run and key not in collected and number(row["pj_per_access"]) > 0 and row.get("valid", "1") == "1":
+                    run[key] = number(row["pj_per_access"])
+                    added += 1
+            print(f"{prefix}: {added} probe(s) enter with the energy of their duty-100 row (--full-rate)")
+        elif not run:
+            print(f"WARNING: {prefix} contributes no probe (no fit over duties; a run at one duty needs --full-rate)")
         for key, energy in run.items():
+            if prefix in full_rate_only and key in collected:
+                continue
             collected.setdefault(key, []).append(energy)
     energies = {key: float(np.mean(values)) for key, values in collected.items()}
     # The fit minimises relative errors (it divides by the energy): a probe at or below 0 (a weak probe whose fit across
@@ -195,6 +223,30 @@ def probe_table(power_prefixes, counters_prefixes):
                               float(np.mean(times[key])) if key in times else math.nan)
         label = f"{key[0]} {key[1]}" + (f" w{key[2]}" if key[2] else "")
         probes.append(Probe(label, energies[key], per_access, family(key[0], key[1]), counter_groups(row)))
+
+    sweep_energy, sweep_time = collections.defaultdict(list), collections.defaultdict(list)
+    for prefix in sweep_prefixes:
+        for r in read_rows(prefix + ".csv"):
+            if r["payload"] == "random" and r["active_sms"] != "all" and r["duty_pct"] == "100" \
+                    and r["operation"].startswith("chase") and number(r["pj_per_access"]) > 0 and r.get("valid", "1") == "1":
+                key = (r["level"], r["operation"], int(r["width_bytes"]), r["active_sms"])
+                sweep_energy[key].append(number(r["pj_per_access"]))
+                sweep_time[key].append(number(r["active_s"]) / number(r["accesses_per_launch"]) * 1e9)
+    for row in rows:
+        key = (row["level"], row["operation"], int(row["width_bytes"]), row["active_sms"])
+        accesses = number(row["accesses_per_launch"])
+        if key not in sweep_energy or row["duty_pct"] != "100" or row["payload"] != "random" or not accesses > 0 \
+                or "smsp__inst_executed.sum" not in row or key in seen:
+            continue
+        seen.add(key)
+        per_access = add_busy({name: value / accesses for name, value in events(row).items()},
+                              float(np.mean(sweep_time[key])))
+        label = f"{key[0]} {key[1]}" + (f" w{key[2]}" if key[2] else "") + f" sms{key[3]}"
+        probes.append(Probe(label, float(np.mean(sweep_energy[key])), per_access, family(key[0], key[1]) + " (SM sweep)",
+                            counter_groups(row)))
+    if sweep_prefixes:
+        print(f"{sum(1 for p in probes if p.family.endswith('(SM sweep)'))} dependent-load probes on fewer SMs "
+              f"(--sm-sweep {','.join(os.path.basename(p) for p in sweep_prefixes)})")
     return probes, table
 
 
@@ -328,12 +380,14 @@ def cross_validate(probes, weighted):
         print("  not predictable (an event of their own): " + "; ".join(alone))
 
 
-def load_validation(prefix, table):
+def load_validation(prefix, table, repeats=False):
     """The configurations of a --validate run that have power and counters, with their measured energies per launch
     recomputed from the run's baseline moved to each row's temperature. When that run's sleeps spanned too few degrees
-    for a slope of their own, the slope of the probe run's baseline (`table`) is used."""
+    for a slope of their own, the slope of the probe run's baseline (`table`) is used. A run with --validate-repeat has
+    each configuration several times (column repeat): only the first measurement unless `repeats`."""
     rows = [row for row in read_rows(prefix + "_validation.csv") if row["valid"] == "1" and "smsp__inst_executed.sum" in row
-            and not math.isnan(number(row["dynamic_energy_j"])) and counter(row, "smsp__inst_executed.sum") > 0]
+            and not math.isnan(number(row["dynamic_energy_j"])) and counter(row, "smsp__inst_executed.sum") > 0
+            and (repeats or row.get("repeat") in (None, "", "0"))]
     if not rows:
         raise SystemExit("the validation run has no rows with power and counters")
 
@@ -583,6 +637,10 @@ def main():
                         help="prefix of the probe power run (its _energy_table.json); several, comma-separated, are averaged")
     parser.add_argument("--counters", required=True,
                         help="prefix of the profiled probe run (its .csv); several, comma-separated, are searched in order")
+    parser.add_argument("--full-rate", help="runs made at one duty, comma-separated: their probes enter with the energy of "
+                        "their duty-100 row (only probes no fit of the --power runs gives)")
+    parser.add_argument("--sm-sweep", help="runs with --latency --sm-sweep, comma-separated: their dependent-load rows on "
+                        "fewer SMs enter as probes (the DRAM busy price over the whole rate range)")
     parser.add_argument("--validation", help="prefix of the --validate run (its _validation.csv)")
     parser.add_argument("--mixed",
                         help="prefix of a run with --mixed (its .csv); several, comma-separated, are searched in order. "
@@ -608,7 +666,9 @@ def main():
     if arguments.csv and not arguments.validation:
         parser.error("--csv writes the predictions of the --validation run")
 
-    probes, table = probe_table(arguments.power.split(","), arguments.counters.split(","))
+    probes, table = probe_table(arguments.power.split(","), arguments.counters.split(","),
+                                arguments.full_rate.split(",") if arguments.full_rate else (),
+                                arguments.sm_sweep.split(",") if arguments.sm_sweep else ())
     if not probes:
         raise SystemExit("no probe has both an energy and counters; check the prefixes")
     mixed = load_mixed(arguments.mixed.split(","), arguments.counters.split(",")) if arguments.mixed else []

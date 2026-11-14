@@ -27,7 +27,9 @@ std::string OperandName(const uint64_t operation)
 std::string ComputeName(const uint64_t operation)
 {
     const std::vector<std::string> names = {"loop", "ffma", "dfma", "imad", "hfma2", "hmma", "mufu", "ffma-static",
-        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop", "fmul-fadd", "mufu-sin"};
+        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop", "fmul-fadd", "mufu-sin", "ffma-pred", "ffma-branch", "iadd-pred",
+        "iadd-branch", "lop3-xor", "shf-rotate", "imnmx-xor", "fadd", "fmul", "ffma-rcp-fadd", "ffma-sqrt-fadd", "ffma-ex2-fadd",
+        "ffma-lg2-fadd", "ffma-rsq-fadd", "isetp-sel", "fsetp-sel", "cvt-i2f-f2i", "fmnmx", "iadd3", "ffma-pred-rotating"};
     return operation < names.size() ? names[operation] : "?";
 }
 
@@ -44,6 +46,10 @@ double FlopsPerOperation(const uint64_t operation, const uint32_t computeCapabil
     case ComputeFfmaLoop:
     case ComputeFmulFadd:
         return 2.0;
+    case ComputeFfmaLanes:
+    case ComputeFfmaLanesBranch:
+    case ComputeFfmaLanesRotating:
+        return NaN; // counted per thread, active or not
     case ComputeHfma2:
         return 4.0; // two FMAs on half2
     case ComputeHmma:

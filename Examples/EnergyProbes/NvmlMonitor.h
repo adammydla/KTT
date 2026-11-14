@@ -64,6 +64,17 @@ struct TraceSummary
 std::string DescribeReasons(const unsigned long long reasons, const bool limitersOnly);
 
 // Talks to NVML directly, independently of KTT's own power measurement.
+// What a model file records about the GPU and its software (tools/build_model.py), so that a model can tell when it was
+// made on another card or driver. Empty or NaN where NVML does not report it (GeForce cards have no serial number).
+struct DeviceProvenance
+{
+    std::string driverVersion;     // nvmlSystemGetDriverVersion
+    std::string cudaDriverVersion; // the CUDA version the driver supports, e.g. 12.9
+    std::string uuid;              // nvmlDeviceGetUUID
+    std::string serial;            // nvmlDeviceGetSerial
+    double powerLimitW = NaN;      // the enforced power limit
+};
+
 class NvmlMonitor
 {
 public:
@@ -102,6 +113,8 @@ public:
     {
         return m_KttReadsSameGpu;
     }
+
+    DeviceProvenance GetProvenance() const;
 
     double GetPowerLimitW() const
     {

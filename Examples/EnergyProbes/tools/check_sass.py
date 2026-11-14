@@ -59,10 +59,17 @@ def variants():
     result.append(("Texture.cu", "probeTexture", {}, "FOOTPRINT"))
     # The FFMAs per load are an argument; MIX_FMAS only names the configuration, so one value stands for all.
     result.append(("Mixed.cu", "probeMixed", {"WIDTH": 16, "MIX_FMAS": 0}, "FOOTPRINT"))
+    result.append(("Mixed.cu", "probeMixed", {"WIDTH": 16, "MIX_FMAS": 0, "MIX_OP": 1}, "FOOTPRINT"))  # --mixed-int
+    for op, width in itertools.product([0, 5], [4, 16]):  # --l1-sweep
+        for sectors, lines in [(1, 1), (2, 1), (4, 1), (4, 4), (8, 4), (16, 4), (32, 32)]:
+            result.append(("L1Sweep.cu", "probeL1Sweep", {"LOAD_OP": op, "WIDTH": width, "SWEEP_SECTORS": sectors,
+                                                          "SWEEP_LINES": lines}, None))
     for op in [0, 5]:
         result.append(("Scatter.cu", "probeScatter", {"LOAD_OP": op, "WIDTH": 16}, "FOOTPRINT"))
         for width in [4, 8]:
             result.append(("Partial.cu", "probePartial", {"LOAD_OP": op, "WIDTH": width}, "FOOTPRINT"))
+        for words in [1, 2, 4]:  # --write-path (8 words is the default above)
+            result.append(("Partial.cu", "probePartial", {"LOAD_OP": op, "WIDTH": 4, "PARTIAL_WORDS": words}, "FOOTPRINT"))
     for op in [0, 1, 2]:
         result.append(("Shared.cu", "probeShared", {"SHARED_OP": op, "SMEM_BYTES": 8192}, None))
     for op in [0, 1]:
@@ -73,6 +80,10 @@ def variants():
     result.append(("Constant.cu", "probeConstant", {}, "CONST_BYTES"))
     for op in range(15):
         result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op}, None))
+    for op in range(19, 34):  # --instr-classes
+        result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op}, None))
+    for op, lanes in itertools.product(list(range(15, 19)) + [34], [0, 1, 32]):  # --lanes
+        result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op, "LANES": lanes}, None))
     for op, width in itertools.product(range(3), [4, 8, 16]):
         result.append(("Write.cu", "probeWrite", {"WRITE_OP": op, "WIDTH": width}, "LOCAL" if op == 2 else "FOOTPRINT"))
     for chains in [1, 4, 16]:

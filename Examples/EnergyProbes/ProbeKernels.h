@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <map>
 #include <vector>
 #include <cuda.h>
 #include <Ktt.h>
@@ -80,6 +81,22 @@ std::string KernelSource(const std::string& directory, const std::string& file);
 
 // The buffers and scalars of the probe kernels (KTT argument ids). The scalars are set by the launchers for every
 // configuration (see ProbeSettings); the kernel files describe what each one means.
+// --misaligned: the random payload in a buffer of its own (driver API, in KTT's context), so that the global probe can
+// read it from a start moved by some bytes off the 128-byte line. The probe's SASS stays the same: only the pointer it
+// gets differs (a KTT argument per offset over this buffer).
+class OffsetBuffer
+{
+public:
+    OffsetBuffer(const uint32_t* data, size_t bytes, size_t slack, ktt::DeviceIndex device);
+    ~OffsetBuffer();
+    OffsetBuffer(const OffsetBuffer&) = delete;
+    OffsetBuffer& operator=(const OffsetBuffer&) = delete;
+    uint64_t Address() const { return static_cast<uint64_t>(m_Buffer); }
+
+private:
+    CUdeviceptr m_Buffer = 0;
+};
+
 struct ProbeArguments
 {
     ktt::ArgumentId data;       // random payload, read by the loads and overwritten by the stores and atomics
@@ -107,6 +124,8 @@ struct ProbeArguments
     std::optional<ktt::ArgumentId> constantData; // probeConstant's __constant__ array (a symbol), with --constant
     std::vector<ktt::ArgumentId> patternData;    // the payloads of --payload-bits (PAYLOAD 2, 3, ...)
     nlohmann::json payloadStatistics;            // bit statistics of every payload (PayloadStatistics), by name
+    std::shared_ptr<OffsetBuffer> offsetBuffer;  // --misaligned: the payload's own buffer
+    std::map<uint64_t, ktt::ArgumentId> offsetData; // --misaligned: the payload from OFFSET_BYTES on
 };
 
 // The data the probes read (`bytes` of it), random so that bits toggle as in real data.
@@ -129,6 +148,7 @@ struct ProbeDefinitions
     std::optional<ktt::KernelDefinitionId> texture;
     std::optional<ktt::KernelDefinitionId> scatter;
     std::optional<ktt::KernelDefinitionId> partial;
+    std::optional<ktt::KernelDefinitionId> l1Sweep; // --l1-sweep
     std::optional<ktt::KernelDefinitionId> banks;
     std::optional<ktt::KernelDefinitionId> mixed;
     std::optional<ktt::KernelDefinitionId> write;
@@ -163,6 +183,7 @@ struct ProbeSettings
     Configure texture;
     Configure scatter;
     Configure partial;
+    Configure l1Sweep;
     Configure banks;
     Configure mixed;
     Configure write;

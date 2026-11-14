@@ -7,7 +7,8 @@
   "GPU has instead (fp16 on its own pipe or inside the fma pipe); one of the two must exist. 'group': an optional",
   "group of counters that older runs lack (the model then counts their events together). 'min_cc': the counter",
   "does not exist below this compute capability, so a GPU below it does not miss it. 'only_with': only that option",
-  "uses it. A new counter goes here first."
+  "uses it. A new counter goes here first.",
+  "'study': true marks a screening counter (NEXT_STEPS_PLAN M3/M4): collected only with --study-counters."
  ],
  "groups": {
   "lsu instructions by memory space": "smsp__inst_executed_op_shared_ld.sum",
@@ -82,6 +83,32 @@
   {"name": "sm__cycles_active.avg", "use": "no event: SM activity (studies)"},
   {"name": "smsp__inst_executed_op_branch.sum", "use": "no event: branches count as inst other (the counter checks the ffma-loop probe)"},
   {"name": "smsp__warps_issue_stalled_long_scoreboard.sum", "use": "no event: cycles warps wait for L1TEX (the stall event was priced 0 and dropped)"},
-  {"name": "sm__cycles_active.sum", "use": "no event: SM activity (studies)"}
+  {"name": "sm__cycles_active.sum", "use": "no event: SM activity (studies)"},
+  {"name": "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum", "use": "L1 requests of global loads (screening M3)", "study": true},
+  {"name": "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum", "use": "L1 requests of global stores (screening M3)", "study": true},
+  {"name": "l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss.sum", "use": "L1 sectors of global loads that miss (screening M3)", "study": true},
+  {"name": "l1tex__t_set_accesses_pipe_lsu_mem_global_op_ld.sum", "use": "L1 set accesses of global loads (screening M3)", "study": true},
+  {"name": "l1tex__m_xbar2l1tex_read_sectors.sum", "use": "sectors from L2 to L1 over the crossbar (screening M3)", "study": true},
+  {"name": "l1tex__m_l1tex2xbar_write_sectors.sum", "use": "sectors from L1 to L2 over the crossbar (screening M3)", "study": true},
+  {"name": "lts__t_tag_requests.sum", "use": "L2 tag requests (screening M3)", "study": true},
+  {"name": "lts__d_sectors_fill_device.sum", "use": "L2 sectors filled from DRAM (screening M3)", "study": true},
+  {"name": "smsp__inst_issued.sum", "use": "warp instructions issued, replays included (screening M3)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_fp32_pred_on.sum", "use": "thread instructions of SASS class fp32 (all FP32: also FMNMX, FSETP, FSEL), predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum", "use": "thread instructions of SASS class fadd, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_fmul_pred_on.sum", "use": "thread instructions of SASS class fmul, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_ffma_pred_on.sum", "use": "thread instructions of SASS class ffma, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_fp64_pred_on.sum", "use": "thread instructions of SASS class fp64, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_fp16_pred_on.sum", "use": "thread instructions of SASS class fp16, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_integer_pred_on.sum", "use": "thread instructions of SASS class integer, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_bit_pred_on.sum", "use": "thread instructions of SASS class bit, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_conversion_pred_on.sum", "use": "thread instructions of SASS class conversion, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_control_pred_on.sum", "use": "thread instructions of SASS class control, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_memory_pred_on.sum", "use": "thread instructions of SASS class memory, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_misc_pred_on.sum", "use": "thread instructions of SASS class misc, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_uniform_pred_on.sum", "use": "thread instructions of SASS class uniform, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_thread_inst_executed_op_inter_thread_communication_pred_on.sum", "use": "thread instructions of SASS class inter_thread_communication, predicate on (screening M3/M4; collected by patching)", "study": true},
+  {"name": "smsp__sass_inst_executed_op_memory_32b.sum", "use": "warp memory instructions of 32b per thread (screening M3)", "study": true},
+  {"name": "smsp__sass_inst_executed_op_memory_64b.sum", "use": "warp memory instructions of 64b per thread (screening M3)", "study": true},
+  {"name": "smsp__sass_inst_executed_op_memory_128b.sum", "use": "warp memory instructions of 128b per thread (screening M3)", "study": true}
  ]
 }

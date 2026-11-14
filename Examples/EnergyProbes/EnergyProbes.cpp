@@ -24,7 +24,7 @@
  *
  * Cache sizes are taken from an MT4G result file (--mt4g), otherwise from
  * conservative defaults. Requires KTT built with --power-usage.
- * See README.md in this folder.
+ * See README.md (the tuner's side), docs/CALIBRATION.md (measuring a GPU) and docs/FINDINGS.md (results).
  */
 
 #include <algorithm>
@@ -160,6 +160,14 @@ int main(int argc, char** argv)
             return 0;
         }
 
+        if (options.dryRun && options.thermalLoad)
+        {
+            const uint64_t phases = (5 * options.duties.size() + 1) * 2;
+            std::cout << "Thermal load (--thermal-load): " << phases << " phases of 60 s preparation + " << options.thermalHoldS
+                << " s hold; about " << (phases * (60 + options.thermalHoldS) + 120) / 60 << " min.\n";
+            return 0;
+        }
+
         if (options.dryRun)
         {
             return DryRun(options);
@@ -168,6 +176,11 @@ int main(int argc, char** argv)
         if (options.thermalCurve)
         {
             return RunThermalCurve(options);
+        }
+
+        if (options.thermalLoad)
+        {
+            return RunThermalLoad(options);
         }
 
         return options.validate.empty() ? RunProbes(options) : RunValidation(options);

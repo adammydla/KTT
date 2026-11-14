@@ -17,6 +17,7 @@
 
 #include "Common.h"
 #include "EnergyModel.h"
+#include "EnergyTuner.h"
 #include "NvmlMonitor.h"
 #include "ProbeKernels.h"
 #include "Tune.h"
@@ -25,25 +26,7 @@
 namespace
 {
 
-constexpr uint64_t TimedLaunches = 3; // per configuration, after one untimed launch
-
-struct TuneRow
-{
-    std::string kernel;
-    std::string configuration;
-    double kernelS = NaN;
-    double temperatureC = NaN;
-    double smClockMHz = NaN;
-    CounterValues counters;
-    std::string note;
-    bool predicted = false;
-    EnergyPrediction prediction;
-    size_t source = 0;          // --tune: index of the timed result the row came from
-    double measuredPowerW = NaN; // --tune-measure: NVML power over back-to-back launches
-    double measuredS = NaN;      // and the kernel's time in those launches
-    double measuredJ = NaN;      // their product: energy per launch
-    std::string measuredChoice;
-};
+using TuneRow = TunedConfiguration;
 
 // Measures the power of a row's configuration and fills its measured fields.
 using Measure = std::function<void(TuneRow&)>;
@@ -78,13 +61,24 @@ std::string Text(const double value, const int digits)
 // Predicts every row, prints the model's choice per kernel and writes the CSV. With `measure`, the candidates (the choice,
 // its contenders and the fastest configuration, or all with --tune-measure all) are then measured and the measured best
 // is the final choice.
-int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& options, const std::string& file,
+int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Options& options, const std::string& file,
     const Measure& measure = {})
 {
+    EnergyModel model = fileModel;
+    model.SetAccounting(AccountingOf(options.accounting), options.idleW.value_or(NaN));
     const EnergyObjective objective = ObjectiveOf(options.objective);
     const double maxSlowdown = options.maxSlowdownPct.has_value() ? options.maxSlowdownPct.value() / 100.0 : NaN;
+    const double maxEnergyIncrease = options.maxEnergyIncreasePct.has_value() ? options.maxEnergyIncreasePct.value() / 100.0
+        : NaN;
     std::cout << "\nModel: " << model.DeviceName() << " at " << Fixed(model.ClockMHz(), 0) << " MHz, relative sd of the "
-        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %\n";
+        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %, accounting " << options.accounting;
+
+    if (model.Accounting() == EnergyAccounting::AboveIdle)
+    {
+        std::cout << " (idle " << Fixed(model.IdlePowerW(), 1) << " W)";
+    }
+
+    std::cout << "\n";
     std::vector<std::string> kernels;
 
     for (auto& row : rows)
@@ -101,7 +95,8 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
 
         try
         {
-            row.prediction = model.Predict(row.counters, row.kernelS, row.temperatureC, row.smClockMHz, !options.lenient);
+            row.prediction = model.Predict(row.counters, row.kernelS, row.temperatureC, row.smClockMHz, !options.lenient,
+                row.kernel);
             row.prediction.label = row.configuration;
             row.predicted = true;
         }
@@ -113,7 +108,8 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
 
     std::ofstream output(file);
     output << "kernel,configuration,kernel_s,temperature_c,sm_clock_mhz,predicted_j,predicted_sd_j,predicted_dynamic_j,"
-        << "baseline_j,choice,measured_power_w,measured_s,measured_j,measured_choice,note\n";
+        << "baseline_j,accounting,choice,measured_power_w,measured_s,measured_j,measured_temperature_c,measured_choice,"
+        << "scaled_predicted_j,measured_wall_s,measured_busy,measured_role,note\n";
     bool failed = false;
 
     for (const auto& kernel : kernels)
@@ -155,7 +151,30 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
         }
         else
         {
-            const EnergyRecommendation choice = model.Recommend(predictions, objective, options.contenderSd, maxSlowdown);
+            EnergyRecommendation choice;
+
+            try
+            {
+                choice = model.Recommend(predictions, objective, options.contenderSd, maxSlowdown, maxEnergyIncrease);
+            }
+            catch (const std::exception& error)
+            {
+                // No admissible configuration under both limits: nothing to recommend for this kernel.
+                std::cout << "  " << error.what() << "\n";
+                failed = true;
+
+                for (const auto& row : rows)
+                {
+                    if (row.kernel == kernel)
+                    {
+                        output << CsvText(row.kernel) << "," << CsvText(row.configuration) << ",,,,,,,," << options.accounting
+                            << ",,,,,,,,,,,no admissible configuration\n";
+                    }
+                }
+
+                continue;
+            }
+
             const EnergyPrediction& best = predictions[choice.index];
             marks[predicted[choice.index]] = "best";
             std::cout << "  use: " << best.label << "\n       " << Text(best.energyJ, 4) << " J +- " << Text(best.sdJ, 2)
@@ -252,11 +271,14 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
                     p.kernelS = predicted[i]->measuredS;
                     return ObjectiveValue(p, objective);
                 };
-                size_t final = predictions.size();
-                std::cout << "  measured with NVML (" << options.validateMs << " ms each; energy = power x kernel time):\n"
+                std::cout << "  measured with NVML (" << options.validateMs << " ms each; energy = baseline x kernel time + "
+                    << "the power above it x wall time; "
+                    << "predicted at the measurement's temperature):\n"
                     << "    " << std::setw(10) << "E [J]" << std::setw(8) << "P [W]" << std::setw(10) << "t [ms]"
                     << std::setw(11) << "predicted" << "  " << std::left << std::setw(10) << "role" << std::right
                     << "configuration\n";
+
+                std::vector<size_t> measuredOnes;
 
                 for (const size_t i : candidates)
                 {
@@ -268,22 +290,123 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
                         continue;
                     }
 
-                    if (final == predictions.size() || measured(i) < measured(final))
-                    {
-                        final = i;
-                    }
-
+                    measuredOnes.push_back(i);
+                    // The baseline at the temperature of this measurement, not of the timing pass.
+                    const double atMeasurement = model.Predict(row.counters, row.kernelS, row.measuredTemperatureC,
+                        row.smClockMHz, false, row.kernel).energyJ;
                     const std::string role = i == choice.index ? "choice" : std::find(choice.contenders.cbegin(),
                         choice.contenders.cend(), i) != choice.contenders.cend() ? "contender" : i == fastestIndex ? "fastest" : "";
                     std::cout << "    " << std::setw(10) << Text(row.measuredJ, 4) << std::setw(8) << Fixed(row.measuredPowerW, 1)
                         << std::setw(10) << Text(row.measuredS * 1e3, 4) << std::setw(9)
-                        << Fixed(100.0 * (predictions[i].energyJ / row.measuredJ - 1.0), 1) << " %  " << std::left
+                        << Fixed(100.0 * (atMeasurement / row.measuredJ - 1.0), 1) << " %  " << std::left
                         << std::setw(10) << role << std::right << row.configuration << "\n";
+                }
+
+                // Measurements closer than the margin are not told apart (NVML's repeatability): among those near the
+                // measured best, the model's choice if it is one of them, else the fastest of them.
+                size_t final = predictions.size();
+                const double margin = options.measureMarginPct / 100.0;
+
+                if (!measuredOnes.empty())
+                {
+                    const size_t lowest = *std::min_element(measuredOnes.cbegin(), measuredOnes.cend(),
+                        [&](const size_t a, const size_t b) { return measured(a) < measured(b); });
+                    std::vector<size_t> tied;
+
+                    for (const size_t i : measuredOnes)
+                    {
+                        if (measured(i) <= measured(lowest) * (1.0 + margin))
+                        {
+                            tied.push_back(i);
+                        }
+                    }
+
+                    final = std::find(tied.cbegin(), tied.cend(), choice.index) != tied.cend() ? choice.index
+                        : *std::min_element(tied.cbegin(), tied.cend(), [&](const size_t a, const size_t b)
+                            { return predicted[a]->measuredS < predicted[b]->measuredS; });
+                    std::cout << "  " << tied.size() << " measured within " << Fixed(100.0 * margin, 1)
+                        << " % of the lowest (--measure-margin, the repeatability of a measurement)\n";
+                }
+
+                // The kernel's scale (measured / predicted dynamic energy, the awake baseline at each measurement's
+                // temperature taken off): it removes the kernel's bias from the predictions of its other configurations
+                // and from comparisons with other kernels. It comes from --tune-scale-configs configurations at evenly
+                // spaced quantiles of the predicted dynamic energy, not from the candidates above: those were chosen for
+                // a low prediction and gave a scale 5.8 % (rms) off the scale over all configurations, the quantiles
+                // 2.0 % (27 kernel runs, NEXT_STEPS_PLAN P1; random picks 2.5 %).
+                const uint64_t scaleConfigs = options.tuneScaleConfigs.value_or(options.tune.size() > 1 ? 5 : 0);
+
+                if (scaleConfigs > 0)
+                {
+                    std::vector<size_t> order(predictions.size());
+
+                    for (size_t i = 0; i < order.size(); ++i)
+                    {
+                        order[i] = i;
+                    }
+
+                    std::sort(order.begin(), order.end(), [&](const size_t a, const size_t b)
+                        { return predictions[a].unscaledDynamicJ < predictions[b].unscaledDynamicJ; });
+                    std::vector<size_t> scaleSet;
+
+                    for (uint64_t q = 0; q < std::min<uint64_t>(scaleConfigs, order.size()); ++q)
+                    {
+                        const size_t position = scaleConfigs == 1 ? order.size() / 2
+                            : static_cast<size_t>(std::llround(static_cast<double>(q) * static_cast<double>(order.size() - 1)
+                                / static_cast<double>(scaleConfigs - 1)));
+                        const size_t i = order[position];
+
+                        if (std::find(scaleSet.cbegin(), scaleSet.cend(), i) == scaleSet.cend())
+                        {
+                            scaleSet.push_back(i);
+                        }
+                    }
+
+                    std::vector<EnergyPrediction> scalePredictions;
+                    std::vector<double> measuredDynamic;
+
+                    for (const size_t i : scaleSet)
+                    {
+                        TuneRow& row = *predicted[i];
+
+                        if (std::isnan(row.measuredJ))
+                        {
+                            measure(row);
+                        }
+
+                        AppendNote(row.measuredRole, "scale");
+
+                        if (!std::isnan(row.measuredJ))
+                        {
+                            scalePredictions.push_back(predictions[i]);
+                            measuredDynamic.push_back(row.measuredJ - model.BaselineW(row.measuredTemperatureC) * row.measuredS);
+                        }
+                    }
+
+                    const double scale = model.KernelScale(kernel, scalePredictions, measuredDynamic);
+
+                    if (!std::isnan(scale))
+                    {
+                        for (TuneRow* row : predicted)
+                        {
+                            row->scaledPredictedJ = model.Predict(row->counters, row->kernelS, row->temperatureC,
+                                row->smClockMHz, false, row->kernel).energyJ;
+                        }
+
+                        std::cout << "  the kernel's scale from " << measuredDynamic.size() << " configurations spread over its "
+                            << "predicted dynamic energy: x " << Fixed(scale, 3) << " (column scaled_predicted_j)\n";
+                    }
+                    else
+                    {
+                        std::cout << "  no kernel scale: " << measuredDynamic.size() << " of the " << scaleSet.size()
+                            << " configurations for it were measured (3 needed)\n";
+                    }
                 }
 
                 if (final != predictions.size())
                 {
                     predicted[final]->measuredChoice = "final";
+                    AppendNote(predicted[final]->measuredRole, "final");
                     std::cout << "  final choice: " << (final == choice.index ? "the model's choice"
                         : std::find(choice.contenders.cbegin(), choice.contenders.cend(), final) != choice.contenders.cend()
                         ? "a contender" : final == fastestIndex ? "the fastest configuration" : "another configuration");
@@ -318,9 +441,11 @@ int Report(const EnergyModel& model, std::vector<TuneRow>& rows, const Options& 
                 << CsvValue(row.predicted ? row.prediction.energyJ : NaN, 12) << ","
                 << CsvValue(row.predicted ? row.prediction.sdJ : NaN, 12) << ","
                 << CsvValue(row.predicted ? row.prediction.dynamicJ : NaN, 12) << ","
-                << CsvValue(row.predicted ? row.prediction.baselineJ : NaN, 12) << ","
+                << CsvValue(row.predicted ? row.prediction.baselineJ : NaN, 12) << "," << options.accounting << ","
                 << (mark != marks.cend() ? mark->second : "") << "," << CsvValue(row.measuredPowerW) << ","
-                << CsvValue(row.measuredS, 12) << "," << CsvValue(row.measuredJ, 12) << "," << row.measuredChoice << ","
+                << CsvValue(row.measuredS, 12) << "," << CsvValue(row.measuredJ, 12) << "," << CsvValue(row.measuredTemperatureC)
+                << "," << row.measuredChoice << "," << CsvValue(row.scaledPredictedJ, 12) << ","
+                << CsvValue(row.measuredWallS, 12) << "," << CsvValue(row.busy, 4) << "," << CsvText(row.measuredRole) << ","
                 << CsvText(row.note) << "\n";
         }
     }
@@ -392,6 +517,7 @@ int RunPredict(const Options& options)
     };
     const size_t temperature = optional("temperature_c");
     const size_t clock = optional("sm_clock_mhz");
+    const size_t repeat = optional("repeat");
     std::vector<TuneRow> rows;
 
     while (std::getline(input, line))
@@ -410,7 +536,9 @@ int RunPredict(const Options& options)
             cells.erase(cells.begin() + static_cast<std::ptrdiff_t>(note) + 1);
         }
 
-        if (cells.size() < header.size() || cells[valid] != "1")
+        // --validate-repeat: the first power measurement of each configuration.
+        if (cells.size() < header.size() || cells[valid] != "1"
+            || (repeat < header.size() && !cells[repeat].empty() && cells[repeat] != "0"))
         {
             continue;
         }
@@ -511,173 +639,52 @@ int RunTune(const Options& options)
         throw std::runtime_error("--tune-measure needs the NVML monitor");
     }
 
-    // What the launcher does: time (0), or measure power over back-to-back launches for this many seconds.
-    double measureS = 0.0;
-    std::optional<TraceSummary> trace;
-    NvmlMonitor* const nvml = monitor.get();
-    const uint64_t traceMs = options.traceIntervalMs;
-    std::vector<ValidationKernel> kernels;
-    std::vector<std::vector<ktt::KernelResult>> results;
+    // The timing and counter passes (EnergyTuner.h), then the model's choice; with --tune-measure, NVML's power of the
+    // candidates.
+    PowerMeter meter;
 
-    // Timing pass: one untimed launch (compilation, first touch of the data), then the timed ones.
+    if (monitor != nullptr)
+    {
+        NvmlMonitor* const nvml = monitor.get();
+        const uint64_t traceMs = options.traceIntervalMs;
+        meter.start = [nvml, traceMs]() { nvml->Start("tune", traceMs); };
+        meter.stop = [nvml]()
+        {
+            const TraceSummary trace = nvml->Stop();
+            return MeterReading{trace.sampledPowerW, trace.meanTemperatureC};
+        };
+    }
+
+    // The measured energy charges the model's baseline over the kernel time and the rest over the wall time.
+    meter.baselineW = [model](const double temperatureC) { return model.BaselineW(temperatureC); };
+    EnergyTuner energyTuner(tuner, meter);
+
+    SetValidationInputs({options.validateData, options.validateSizeScale, options.accelwattchDirectory});
+
     for (const auto& name : options.tune)
     {
-        kernels.push_back(AddValidationKernel(tuner, name, kernelPrefix + "../Examples/"));
-        const ktt::KernelDefinitionId definition = kernels.back().definition;
-        tuner.SetLauncher(kernels.back().kernel, [definition, &measureS, &trace, nvml, traceMs](ktt::ComputeInterface& interface)
+        const ValidationKernel kernel = AddValidationKernel(tuner, name, kernelPrefix + "../Examples/");
+        energyTuner.AddKernel(name, kernel.kernel, kernel.definition, kernel.compilerOptions);
+
+        if (options.validateSeed.has_value())
         {
-            if (interface.GetProfiling(definition))
-            {
-                interface.RunKernelWithProfiling(definition);
-                return;
-            }
-
-            interface.RunKernel(definition);
-
-            if (!(measureS > 0.0))
-            {
-                for (uint64_t i = 0; i < TimedLaunches; ++i)
-                {
-                    interface.RunKernel(definition);
-                }
-
-                return;
-            }
-
-            // As the validation's power pass: back-to-back launches while the NVML trace runs.
-            nvml->Start("tune", traceMs);
-            const auto begin = std::chrono::steady_clock::now();
-
-            do
-            {
-                interface.RunKernel(definition);
-            }
-            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() < measureS);
-
-            trace = nvml->Stop();
-        });
-        tuner.SetCompilerOptions(kernels.back().compilerOptions);
-        tuner.SetSearcher(kernels.back().kernel, std::make_unique<ktt::RandomSearcher>());
-        results.push_back(tuner.Tune(kernels.back().kernel, std::make_unique<ktt::ConfigurationCount>(options.validateConfigs)));
-        tuner.SetCompilerOptions("");
-    }
-
-    // Counter pass: profiling replays the kernel, so its times are not the kernel's.
-    tuner.SetProfiling(true);
-
-    if (!tuner.GetProfiling())
-    {
-        throw std::runtime_error("profiling could not be enabled (build KTT with --profiling=cupti)");
-    }
-
-    tuner.SetProfilingCounters(model.Counters());
-    std::vector<TuneRow> rows;
-
-    for (size_t k = 0; k < kernels.size(); ++k)
-    {
-        tuner.SetCompilerOptions(kernels[k].compilerOptions);
-        std::vector<ktt::KernelResult> profiled; // saved as KTT writes them, for tools/energy_predictor.py --ktt
-
-        for (const auto& timed : results[k])
+            tuner.SetSearcher(kernel.kernel, std::make_unique<SeededSearcher>(options.validateSeed.value()));
+        }
+        else
         {
-            TuneRow row;
-            row.kernel = kernels[k].name;
-            row.source = static_cast<size_t>(&timed - results[k].data());
-
-            for (const auto& pair : timed.GetConfiguration().GetPairs())
-            {
-                row.configuration += (row.configuration.empty() ? "" : " ") + pair.GetName() + "=" + pair.GetValueString();
-            }
-
-            const auto& computations = timed.GetResults();
-
-            if (!timed.IsValid() || computations.size() < 2)
-            {
-                AppendNote(row.note, "run failed");
-                rows.push_back(row);
-                continue;
-            }
-
-            double ns = 0.0;
-            double temperature = 0.0;
-            double clock = 0.0;
-
-            for (size_t i = 1; i < computations.size(); ++i)
-            {
-                ns += static_cast<double>(computations[i].GetDuration());
-                temperature += computations[i].GetTemperature();
-                clock += static_cast<double>(computations[i].GetSMFrequency());
-            }
-
-            const double launches = static_cast<double>(computations.size() - 1);
-            row.kernelS = ns * 1e-9 / launches;
-            // KTT reads both from NVML when it is built with --power-usage; 0 otherwise.
-            row.temperatureC = temperature > 0.0 ? temperature / launches : NaN;
-            row.smClockMHz = clock > 0.0 ? clock / launches : NaN;
-
-            // One pass per Run; the last pass carries the counters (as in the validation's counter pass).
-            ktt::KernelResult result = tuner.Run(kernels[k].kernel, timed.GetConfiguration(), {});
-
-            while (result.IsValid() && result.HasRemainingProfilingRuns())
-            {
-                result = tuner.Run(kernels[k].kernel, timed.GetConfiguration(), {});
-            }
-
-            if (result.IsValid() && !result.GetResults().empty() && result.GetResults()[0].HasProfilingData())
-            {
-                for (const auto& counter : result.GetResults()[0].GetProfilingData().GetCounters())
-                {
-                    row.counters[counter.GetName()] = CounterValue(counter);
-                }
-
-                profiled.push_back(result);
-            }
-            else
-            {
-                AppendNote(row.note, "no counters");
-            }
-
-            rows.push_back(row);
+            tuner.SetSearcher(kernel.kernel, std::make_unique<ktt::RandomSearcher>());
         }
 
-        tuner.SaveResults(profiled, options.outputPrefix + "_" + kernels[k].name + "_counters", ktt::OutputFormat::JSON);
+        energyTuner.TimeConfigurations(name, options.validateConfigs);
     }
 
-    tuner.SetCompilerOptions("");
-    tuner.SetProfiling(false);
+    std::vector<TuneRow> rows = energyTuner.CollectCounters(model.Counters(), options.outputPrefix);
     Measure measure;
 
     if (options.tuneMeasure != "none")
     {
-        measure = [&](TuneRow& row)
-        {
-            const size_t k = static_cast<size_t>(std::find_if(kernels.cbegin(), kernels.cend(),
-                [&row](const ValidationKernel& kernel) { return kernel.name == row.kernel; }) - kernels.cbegin());
-            measureS = static_cast<double>(options.validateMs) * 1e-3;
-            trace.reset();
-            tuner.SetCompilerOptions(kernels[k].compilerOptions);
-            const ktt::KernelResult result = tuner.Run(kernels[k].kernel, results[k][row.source].GetConfiguration(), {});
-            tuner.SetCompilerOptions("");
-            measureS = 0.0;
-            const auto& computations = result.GetResults();
-
-            if (!result.IsValid() || computations.size() < 2 || !trace.has_value())
-            {
-                AppendNote(row.note, "power measurement failed");
-                return;
-            }
-
-            double ns = 0.0;
-
-            for (size_t i = 1; i < computations.size(); ++i)
-            {
-                ns += static_cast<double>(computations[i].GetDuration());
-            }
-
-            row.measuredS = ns * 1e-9 / static_cast<double>(computations.size() - 1);
-            row.measuredPowerW = trace->sampledPowerW;
-            row.measuredJ = row.measuredPowerW * row.measuredS;
-        };
+        const double seconds = static_cast<double>(options.validateMs) * 1e-3;
+        measure = [&energyTuner, seconds](TuneRow& row) { energyTuner.MeasurePower(row, seconds); };
     }
 
     return Report(limited, rows, options, options.outputPrefix + "_tune.csv", measure);

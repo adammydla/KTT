@@ -29,8 +29,11 @@ read_rows = counter_table.read_rows  # the rows of a run's CSV (repairs rows wit
 
 
 def counter(row, name):
+    """A counter's value; 0 if the row has none. Negative values count as 0: CUPTI reports the two L2 reduction counters
+    negative now and then in kernels without reductions (down to -1.8 million sectors in a probe row), which would make
+    an event negative."""
     value = value_of(row, name)
-    return 0.0 if math.isnan(value) else value
+    return 0.0 if math.isnan(value) or value < 0 else value
 
 
 # The lsu pipe's instructions of shared memory and of the global path (smsp__inst_executed_op_<op>.sum).
@@ -104,7 +107,7 @@ def events(row, fma_halves=None):
     # mixed probes) splits exactly half and half, and the FFMAs of a dependent chain (the MUFU probe) run on the lite half;
     # an fp16 instruction counts in both halves. With one event, the fit prices an FFMA between the FFMA probe and the
     # IMAD probe (8 % under ffma3). The split fixes that and lowers the bias on the example kernels, but it widens their
-    # scatter (see the README), so it is not the default. Runs without the half counters have only the one event.
+    # scatter (see docs/FINDINGS.md), so it is not the default. Runs without the half counters have only the one event.
     fma_pipe = fma_lanes if separate_fp16 else max(fma_lanes - fp16_lanes, 0.0)
     lite = value_of(row, "sm__thread_inst_executed_pipe_fmalite_pred_on.sum")
     lite = min(max(lite / 32 - fp16_lanes, 0.0), fma_pipe) if fma_halves and not math.isnan(lite) else 0.0

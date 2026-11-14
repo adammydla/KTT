@@ -116,6 +116,37 @@ NvmlMonitor::NvmlMonitor(const ktt::DeviceIndex cudaOrdinal)
     m_HasEnergyCounter = nvmlDeviceGetTotalEnergyConsumption(m_Device, &energy) == NVML_SUCCESS;
 }
 
+DeviceProvenance NvmlMonitor::GetProvenance() const
+{
+    DeviceProvenance provenance;
+    char text[NVML_DEVICE_UUID_V2_BUFFER_SIZE > 96 ? NVML_DEVICE_UUID_V2_BUFFER_SIZE : 96] = {};
+
+    if (nvmlSystemGetDriverVersion(text, sizeof(text)) == NVML_SUCCESS)
+    {
+        provenance.driverVersion = text;
+    }
+
+    int cuda = 0;
+
+    if (nvmlSystemGetCudaDriverVersion_v2(&cuda) == NVML_SUCCESS && cuda > 0)
+    {
+        provenance.cudaDriverVersion = std::to_string(cuda / 1000) + "." + std::to_string(cuda % 1000 / 10);
+    }
+
+    if (nvmlDeviceGetUUID(m_Device, text, sizeof(text)) == NVML_SUCCESS)
+    {
+        provenance.uuid = text;
+    }
+
+    if (nvmlDeviceGetSerial(m_Device, text, sizeof(text)) == NVML_SUCCESS)
+    {
+        provenance.serial = text;
+    }
+
+    provenance.powerLimitW = m_PowerLimitW;
+    return provenance;
+}
+
 NvmlMonitor::~NvmlMonitor()
 {
     StopSampling();
