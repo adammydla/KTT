@@ -24,6 +24,9 @@
 
 #include "EnergyModel.h"
 
+// The value of a CUPTI counter as a number, whatever its type.
+double CounterValue(const ktt::KernelProfilingCounter& counter);
+
 // What a power meter read over a measurement.
 struct MeterReading
 {

@@ -24,11 +24,11 @@ const std::vector<std::vector<std::string>> RequiredKeys = {{"device"}, {"option
     {"baseline", "mean_temperature_c"}, {"baseline", "slope_w_per_c"}, {"uncertainty", "dynamic_relative_sd"},
     {"counters", "required"}, {"counters", "lsu_shared"}, {"counters", "lsu_global"}, {"counters", "aliases"}};
 
-// Optional counters for model files from before 2026-11-13 (energy_predictor.py OPTIONAL_COUNTERS).
+// Optional counters for model files that do not list them (energy_predictor.py OPTIONAL_COUNTERS).
 const std::vector<std::string> DefaultOptional = {"sm__thread_inst_executed_pipe_alu_pred_on.sum",
     "sm__thread_inst_executed_pipe_fma_pred_on.sum", "sm__thread_inst_executed_pipe_fp16_pred_on.sum",
     "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum", "smsp__inst_executed_pipe_fp16.sum",
-    "smsp__inst_executed_pipe_fma_type_fp16.sum", "sm__thread_inst_executed_pipe_fmalite_pred_on.sum"};
+    "smsp__inst_executed_pipe_fma_type_fp16.sum"};
 
 // A counter value for a message, without trailing zeros.
 std::string ValueText(const double value)
@@ -123,13 +123,8 @@ void EnergyModel::Load(const nlohmann::json& root)
     m_Device = device.value("name", std::string());
     m_ClockMHz = NumberOr(device, "sm_clock_mhz", NotANumber);
 
-    // The events in the order of energy_events.py, so that sums add up in the same order as there.
-    for (const std::string name : {"inst alu", "inst fma (fp32, imad)", "inst fma lite (fp32)", "inst fp16", "inst fp64",
-        "inst tensor", "inst xu (mufu)", "inst lsu shared", "inst lsu global", "inst lsu other", "inst tex", "inst other",
-        "L1 sector", "L1 tex sector", "L2 read sector", "L2 write sector", "L2 read request", "L2 write request",
-        "L2 read miss request", "L2 partial write miss request", "DRAM read sector", "DRAM write sector", "L2 atom sector",
-        "L2 red sector", "shared ld wavefront", "shared st wavefront", "shared ld conflict", "shared st conflict",
-        "shared atom wavefront", "const request", "const L1 miss", "DRAM busy ns"})
+    // The events in the order of energy_events.py (Events()), so that sums add up in the same order as there.
+    for (const auto& [name, count] : Events(CounterValues{}, 0.0))
     {
         double energy = 0.0;
 
@@ -173,10 +168,7 @@ void EnergyModel::Load(const nlohmann::json& root)
         }
     }
 
-    const auto& options = root.at("options");
-    m_Busy = options.value("busy", true);
-    m_BusyScaleGbs = NumberOr(options, "busy_scale_gbs", 95.0);
-    m_FmaHalves = options.value("fma_halves", false);
+    m_BusyScaleGbs = NumberOr(root.at("options"), "busy_scale_gbs", 95.0);
 
     const auto& baseline = root.at("baseline");
     m_BaselineW = baseline.at("mean_w").get<double>();
@@ -387,16 +379,12 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
         globalInst += Count(c, name);
     }
 
-    const double fmaPipe = separateFp16 ? fmaLanes : std::max(fmaLanes - fp16Lanes, 0.0);
-    const double liteValue = Value(c, "sm__thread_inst_executed_pipe_fmalite_pred_on.sum");
-    const double lite = m_FmaHalves && !std::isnan(liteValue)
-        ? std::min(std::max(liteValue / 32.0 - fp16Lanes, 0.0), fmaPipe) : 0.0;
     const double dramRead = Count(c, "dram__sectors_read.sum");
     const double dramWrite = Count(c, "dram__sectors_write.sum");
     double busyNs = 0.0;
     const double ns = kernelS * 1e9;
 
-    if (m_Busy && ns > 0.0)
+    if (ns > 0.0)
     {
         const double rate = (dramRead + dramWrite) * 32.0 / ns; // GB/s
         busyNs = ns * -std::expm1(-rate / m_BusyScaleGbs);
@@ -404,8 +392,7 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
 
     return {
         {"inst alu", aluLanes},
-        {"inst fma (fp32, imad)", fmaPipe - lite},
-        {"inst fma lite (fp32)", lite},
+        {"inst fma (fp32, imad)", separateFp16 ? fmaLanes : std::max(fmaLanes - fp16Lanes, 0.0)},
         {"inst fp16", fp16Lanes},
         {"inst fp64", fp64},
         {"inst tensor", tensor},

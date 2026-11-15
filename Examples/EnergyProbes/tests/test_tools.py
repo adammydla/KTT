@@ -3,10 +3,10 @@
     python3 -m pytest Examples/EnergyProbes/tests -q            # from the KTT root; about half a minute
     EP_BINARY=/path/to/EnergyProbesCuda python3 -m pytest ...   # another build (default: Build/x86_64_Release)
 
-No GPU is needed. The data in tests/data are real runs of an RTX 3090 at 1200 MHz: the probe power run Preset3 with its
-energy table, the counter runs ProfileModel1 and ProfileNew2, the misaligned and write-path probes MisalignedWrite2 (at
-one duty, --full-rate), the validation run Validation13, and the MT4G file. The tests of the program
-(--predict, --dry-run, option checks) are skipped when it is not built.
+No GPU is needed. The data in tests/data are real runs of an RTX 3090 at 1200 MHz, made with the commands of the
+README: the probe run (Probes.csv and its energy table), the counter run (Profile.csv), the validation run
+(Validation_validation.csv) and a KTT output file of its counter pass. models/ has the model built from them and the
+MT4G file. The tests of the program (--predict, --dry-run, option checks) are skipped when it is not built.
 """
 
 import copy
@@ -27,8 +27,8 @@ TOOLS = os.path.join(ROOT, "tools")
 DATA = os.path.join(HERE, "data")
 MODEL = os.path.join(ROOT, "models", "rtx3090_1200mhz.model.json")
 BINARY = os.environ.get("EP_BINARY", os.path.join(ROOT, "..", "..", "Build", "x86_64_Release", "EnergyProbesCuda"))
-MT4G = os.path.join(DATA, "NVIDIA_GeForce_RTX_3090.json")
-VALIDATION = os.path.join(DATA, "Validation13_validation.csv")
+MT4G = os.path.join(ROOT, "models", "NVIDIA_GeForce_RTX_3090.json")
+VALIDATION = os.path.join(DATA, "Validation_validation.csv")
 
 sys.path.insert(0, TOOLS)
 import counter_table  # noqa: E402
@@ -78,7 +78,7 @@ def test_read_rows_repairs_a_comma_in_the_note(tmp_path):
 
 
 def test_reference_runs_have_no_shifted_rows():
-    for name in ("Preset3.csv", "ProfileModel1.csv", "Validation13_validation.csv"):
+    for name in ("Probes.csv", "Profile.csv", "Validation_validation.csv"):
         with open(os.path.join(DATA, name), newline="") as file:
             lengths = {len(fields) for fields in csv.reader(file)}
         assert len(lengths) == 1, name
@@ -100,10 +100,10 @@ def test_instruction_events_add_up_to_the_instructions(validation):
 
 def test_busy_event_follows_the_dram_rate():
     counts = {"DRAM read sector": 1e9, "DRAM write sector": 0.0}
-    busy = energy_events.add_busy(dict(counts), 1e9, busy=True, scale_gbs=95.0)["DRAM busy ns"]  # 32 GB/s for 1 s
+    busy = energy_events.add_busy(dict(counts), 1e9, 95.0)["DRAM busy ns"]  # 32 GB/s for 1 s
     assert busy == pytest.approx(1e9 * (1 - math.exp(-32 / 95.0)))
-    assert energy_events.add_busy(dict(counts), 1e9, busy=False)["DRAM busy ns"] == 0.0
-    assert energy_events.add_busy(dict(counts), 0.0, busy=True)["DRAM busy ns"] == 0.0
+    assert energy_events.add_busy(dict(counts), 1e9)["DRAM busy ns"] == pytest.approx(busy)  # 95 GB/s is the default
+    assert energy_events.add_busy(dict(counts), 0.0)["DRAM busy ns"] == 0.0
 
 
 def test_every_counter_of_the_events_is_in_the_counter_table():
@@ -114,7 +114,7 @@ def test_cpp_predictor_knows_the_same_events():
     with open(os.path.join(ROOT, "EnergyModel.cpp")) as file:
         source = file.read()
     for name in energy_events.EVENTS:
-        assert source.count('"' + name + '"') >= 2, name  # the constructor's list and Events()
+        assert '"' + name + '"' in source, name
 
 
 # ---- Fit and model file -------------------------------------------------------------------------------------------------
@@ -123,43 +123,75 @@ def test_the_model_file_is_what_the_reference_runs_give(tmp_path, model):
     """build_model.py on the reference runs reproduces the energies of the shipped model: a change in the fit, the events
     or the CSV reading shows here."""
     output = tmp_path / "rebuilt.model.json"
-    result = tool("build_model.py", "--power", "Preset3", "--counters", "ProfileModel1,ProfileNew2", "--full-rate",
-                  "MisalignedWrite2", "--calibration", "Validation13", "--output", str(output))
+    result = tool("build_model.py", "--power", "Probes", "--counters", "Profile", "--calibration", "Validation",
+                  "--output", str(output))
     rebuilt = energy_predictor.Model.load(str(output))
     for name, energy in model.pj.items():
         assert rebuilt.pj[name] == pytest.approx(energy, rel=1e-6, abs=1e-6), name
     assert rebuilt.baseline == model.baseline
     assert rebuilt.required == model.required
-    # One validation run instead of five: the relative sd is of the same size.
-    assert 0.04 < rebuilt.uncertainty["dynamic_relative_sd"] < 0.08
+    assert rebuilt.uncertainty["dynamic_relative_sd"] == pytest.approx(model.uncertainty["dynamic_relative_sd"], rel=1e-6)
+    assert len(rebuilt.data["probes"]) == len(model.data["probes"]) == 150
     assert "ordered right" in result.stdout
+    # The file is written one entry per line.
+    assert len(output.read_text().splitlines()) < 400
 
 
-def test_reference_scores(model):
-    """The scores of the model's fit (Preset3 + ProfileModel1, ProfileNew2 + MisalignedWrite2) on Validation13."""
-    result = tool("score_ranking.py", "--power", "Preset3", "--counters", "ProfileModel1,ProfileNew2", "--full-rate",
-                  "MisalignedWrite2", "--validation", "Validation13")
-    line = next(l for l in result.stdout.splitlines() if "mean over the example kernels" in l)
+def test_energy_model_fit_and_scores():
+    """The fit over the reference runs and its scores on the validation run."""
+    result = tool("energy_model.py", "--power", "Probes", "--counters", "Profile", "--validation", "Validation")
+    assert "Fit over 150 probes" in result.stdout and "no probe" in result.stdout
+    line = next(l for l in result.stdout.splitlines() if "mean over the kernel runs" in l)
     scatter, bias, mape, regret = (float(part.split()[-2 if "regret" not in part else 2].rstrip("%"))
                                    for part in line.split(":", 1)[1].split(",")[:4])
-    assert scatter == pytest.approx(6.3, abs=0.3)
-    assert abs(bias) < 5 and mape < 4.0 and regret <= 2.5
+    assert scatter == pytest.approx(5.5, abs=0.3)
+    assert abs(bias) < 2 and mape < 3.0 and regret <= 1.0
+
+
+def test_probes_at_one_duty_enter_with_their_row(tmp_path):
+    """The dependent loads, the write-path and the misaligned probes run at duty 100 only: no fit, the row's energy.
+    A probe that has two duties but no fit (a row withheld) stays out."""
+    import contextlib
+    import io
+    import energy_model as m
+    with contextlib.redirect_stdout(io.StringIO()):
+        probes, _ = m.probe_table([os.path.join(DATA, "Probes")], [os.path.join(DATA, "Profile")])
+    rows = {m.label_of(m.key_of(r)): r for r in m.probe_rows(os.path.join(DATA, "Probes"))}
+    energies = {p.label: p.energy for p in probes}
+    for label in ("DRAM chase-c16-w32 w4", "L2 st-off32 w16", "DRAM ld-sub-pairs-1words w4"):
+        assert energies[label] == pytest.approx(float(rows[label]["pj_per_access"]))
+    assert energies["L1 ld w16"] != pytest.approx(float(rows["L1 ld w16"]["pj_per_access"]), rel=1e-3)  # a slope
+    assert "compute ffma" not in energies and "compute ffma3" in energies  # x * x + c stays out of the fit
+    # Without its fit, a probe measured at two duties does not fall back to its duty-100 row.
+    for name in ("Probes.csv", "Probes_energy_table.json"):
+        shutil.copy(os.path.join(DATA, name), tmp_path / name)
+    with open(tmp_path / "Probes_energy_table.json") as file:
+        table = json.load(file)
+    table["fits"] = [f for f in table["fits"] if not (f["operation"] == "ld" and f["level"] == "L1" and f["width_bytes"] == 16)]
+    (tmp_path / "Probes_energy_table.json").write_text(json.dumps(table))
+    with contextlib.redirect_stdout(io.StringIO()):
+        fewer, _ = m.probe_table([str(tmp_path / "Probes")], [os.path.join(DATA, "Profile")])
+    assert "L1 ld w16" not in {p.label for p in fewer} and len(fewer) == len(probes) - 1
+
+
+def test_runs_must_have_the_same_counters():
+    import energy_model as m
+    rows = m.probe_rows(os.path.join(DATA, "Profile"))
+    m.check_same_counters({"probes": rows, "validation": counter_table.read_rows(VALIDATION)})
+    without = [{k: v for k, v in r.items() if k != "dram__sectors_read.sum"} for r in rows]
+    with pytest.raises(SystemExit, match="dram__sectors_read"):
+        m.check_same_counters({"probes": without, "validation": counter_table.read_rows(VALIDATION)})
 
 
 def test_predictor_equals_energy_model(model, validation):
     import contextlib
     import io
     import energy_model as m
-    m.configure()
     with contextlib.redirect_stdout(io.StringIO()):
-        probes, table = m.probe_table([os.path.join(DATA, "Preset3")],
-                                      [os.path.join(DATA, "ProfileModel1"), os.path.join(DATA, "ProfileNew2")],
-                                      [os.path.join(DATA, "MisalignedWrite2")])
-        rows = m.load_validation(os.path.join(DATA, "Validation13"), table)
-    probes = [p for p in probes if p.label not in m.TWO_REGISTER_FFMA and p.label not in m.CHECK_ONLY]
-    energies, _, _ = m.fit(probes, m.EVENTS)
-    simple, _, _ = m.fit(probes, m.SIMPLE)
-    reference = {(r["kernel"], r["configuration"]): r["predicted_dynamic_j"] for r in m.predict(rows, energies, simple)}
+        probes, table = m.probe_table([os.path.join(DATA, "Probes")], [os.path.join(DATA, "Profile")])
+        rows = m.load_validation(os.path.join(DATA, "Validation"), table)
+    energies, _, _ = m.fit(probes)
+    reference = {(row["kernel"], row["configuration"]): result[2] for row, result in zip(rows, m.predict(rows, energies))}
     compared = 0
     for kernel, configurations in validation.items():
         for label, row, seconds, _, _ in configurations:
@@ -266,13 +298,11 @@ def test_recommend(model):
 
 
 def test_the_choice_on_the_validation_run_is_good(model, validation):
-    """On every kernel of Validation13 the model's first choice uses at most 2.5 % more energy than the measured best,
-    and the measured best is the choice or one of its contenders."""
+    """On every kernel of the validation run the model's first choice uses at most 2.5 % more energy than the measured
+    best, and the measured best is the choice or one of its contenders."""
     rows = counter_table.read_rows(VALIDATION)
     measured = {(r["kernel"], r["configuration"]): counter_table.number(r["energy_j"]) for r in rows}
     for kernel, configurations in validation.items():
-        if kernel == "mixed":
-            continue
         predictions = [model.predict(row, seconds, temperature, label=label)
                        for label, row, seconds, temperature, _ in configurations]
         choice = energy_predictor.recommend(model, predictions)
@@ -363,15 +393,15 @@ def test_power_limit_uncertainty(model, validation):
 
 
 def test_kernels_compared_with_the_wider_sd(model):
-    """Two predictions 10 % apart: told apart within one kernel, contenders when they are two kernels (the bias between
-    kernels, 5.4 %, widens the sd to about 8.3 % per prediction)."""
-    within = [prediction(1.0, 0.5, 1.0)._replace(group="a"), prediction(1.1, 0.55, 1.0)._replace(group="a")]
+    """Two predictions 9 % apart: told apart within one kernel, contenders when they are two kernels (the bias between
+    kernels widens the sd per prediction)."""
+    within = [prediction(1.0, 0.5, 1.0)._replace(group="a"), prediction(1.09, 0.545, 1.0)._replace(group="a")]
     assert energy_predictor.recommend(model, within).confident
     between = [within[0], within[1]._replace(group="b")]
     choice = energy_predictor.recommend(model, between)
     assert choice.index == 0 and choice.contenders == [1]
     assert model.between_kernels_sd() == pytest.approx(model.uncertainty["dynamic_bias_sd_between_kernels"])
-    assert 0.03 < model.between_kernels_sd() < 0.08
+    assert 0.02 < model.between_kernels_sd() < 0.08
 
 
 def test_kernel_scale(validation):
@@ -419,8 +449,9 @@ def test_accounting(validation):
 def test_model_file_provenance(model):
     assert set(model.data["tools"]) == {"commit", "events_sha256"}
     for key in ("driver_version", "cuda_driver_version", "uuid", "power_limit_w"):
-        assert key in model.device  # null for runs from before 2026-11-13
-    assert model.data["uncertainty"]["calibration"]["left_out_off_clock"] == 3
+        assert model.device[key]
+    assert model.data["uncertainty"]["calibration"]["left_out_off_clock"] == 2
+    assert set(model.data["options"]) == {"busy_scale_gbs"}
     assert model.optional == list(energy_predictor.OPTIONAL_COUNTERS)
 
 
@@ -494,7 +525,7 @@ def test_minimal_tuner_example_builds(tmp_path):
 
 def edited_run(tmp_path, name, change):
     """A copy of the reference power run with every probe row changed by change(row)."""
-    rows = counter_table.read_rows(os.path.join(DATA, "Preset3.csv"))
+    rows = counter_table.read_rows(os.path.join(DATA, "Probes.csv"))
     path = tmp_path / (name + ".csv")
     with open(path, "w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
@@ -507,7 +538,7 @@ def edited_run(tmp_path, name, change):
 
 
 def test_check_model_passes_on_its_own_calibration_run():
-    result = tool("check_model.py", "--model", MODEL, "--run", "Preset3")
+    result = tool("check_model.py", "--model", MODEL, "--run", "Probes")
     assert "PASS" in result.stdout
 
 
@@ -555,7 +586,7 @@ def test_check_model_judges_the_baseline(tmp_path):
     def higher_sleep(row):
         if row["level"] == "baseline" and row["probe"].startswith("sleep-"):
             row["power_w"] = repr(1.05 * float(row["power_w"]))
-    run = edited_rows(tmp_path, "Preset3", "Warm", higher_sleep)
+    run = edited_rows(tmp_path, "Probes", "Warm", higher_sleep)
     written = tmp_path / "baseline.model.json"
     result = tool("check_model.py", "--model", MODEL, "--run", run, "--write", str(written))
     assert "BASELINE" in result.stdout and "PASS" not in result.stdout
@@ -565,33 +596,32 @@ def test_check_model_judges_the_baseline(tmp_path):
 
 
 def test_check_model_compares_counts(tmp_path):
-    result = tool("check_model.py", "--model", MODEL, "--run", "Preset3", "--counters", "ProfileModel1")
+    result = tool("check_model.py", "--model", MODEL, "--run", "Probes", "--counters", "Profile")
     assert "PASS" in result.stdout and "0 move" in result.stdout
 
     def doubled(row):
         if row.get("dram__sectors_read.sum"):
             row["dram__sectors_read.sum"] = repr(2 * float(row["dram__sectors_read.sum"]))
-    run = edited_rows(tmp_path, "ProfileModel1", "Doubled", doubled)
-    result = tool("check_model.py", "--model", MODEL, "--run", "Preset3", "--counters", run, check=False)
+    run = edited_rows(tmp_path, "Profile", "Doubled", doubled)
+    result = tool("check_model.py", "--model", MODEL, "--run", "Probes", "--counters", run, check=False)
     assert result.returncode == 1 and "event counts differ" in result.stdout and "DRAM read sector" in result.stdout
 
 
-# ---- The other tools still run on the reference runs --------------------------------------------------------------------
+# ---- check_run.py -------------------------------------------------------------------------------------------------------
 
-def test_energy_model_report():
-    result = tool("energy_model.py", "--power", "Preset3", "--counters", "ProfileModel1", "--validation", "Validation13",
-                  "--cross-validate")
-    assert "Fit over 134 probes" in result.stdout and "Leave-one-out" in result.stdout
-
-
-def test_check_run():
-    result = tool("check_run.py", "Preset3", "--counters", "ProfileModel1", check=False)
-    assert "Traceback" not in result.stdout and "locality, write, mixed hit their level" in result.stdout
+def test_check_run_passes_on_the_reference_runs():
+    result = tool("check_run.py", "Probes", "--counters", "Profile")
+    assert "0 warnings, 0 failed" in result.stdout and "locality, write hit their level" in result.stdout
 
 
-def test_check_counters():
-    result = tool("check_counters.py", "--csv", "ProfileModel1.csv", check=False)
-    assert "Traceback" not in result.stdout
+def test_check_run_finds_a_throttled_row(tmp_path):
+    def throttled(row):
+        if row["operation"] == "ld" and row["level"] == "DRAM" and row["width_bytes"] == "16" and row["duty_pct"] == "100":
+            row["clock_difference_pct"] = "-9.5"
+    run = edited_rows(tmp_path, "Probes", "Throttled", throttled)
+    shutil.copy(os.path.join(DATA, "Probes_energy_table.json"), run + "_energy_table.json")
+    result = tool("check_run.py", run, check=False)
+    assert result.returncode == 1 and "FAIL  SM clock of every row" in result.stdout
 
 
 # ---- The program without a GPU ------------------------------------------------------------------------------------------
@@ -644,24 +674,29 @@ def test_cpp_predictor_objectives_and_errors(tmp_path):
 @needs_binary
 def test_dry_run_plans():
     default = program("--dry-run", "--mt4g", MT4G)
-    assert default.returncode == 0
-    preset = program("--dry-run", "--mt4g", MT4G, "--model")
-    assert preset.returncode == 0 and "458" in preset.stdout
+    assert default.returncode == 0 and "242 configurations (12 of them baselines)" in default.stdout
+    # The plan is the run of the reference data: one row per configuration (and three idle readings).
+    assert len(counter_table.read_rows(os.path.join(DATA, "Probes.csv"))) == 242 + 3
     quick = program("--dry-run", "--mt4g", MT4G, "--quick")
-    assert quick.returncode == 0 and "30 configurations" in quick.stdout
+    assert quick.returncode == 0 and "39 configurations" in quick.stdout
+    profile = program("--dry-run", "--mt4g", MT4G, "--profile")
+    assert profile.returncode == 0 and "163 configurations" in profile.stdout
+    assert len(counter_table.read_rows(os.path.join(DATA, "Profile.csv"))) == 163
     # An explicit option wins over a preset wherever it stands.
-    assert "each at duty 50 %" in program("--dry-run", "--mt4g", MT4G, "--duty", "50", "--quick").stdout
-    everything = program("--dry-run", "--mt4g", MT4G, "--all")
-    assert everything.returncode == 0 and "918" in everything.stdout
+    assert "at duty 50 " in program("--dry-run", "--mt4g", MT4G, "--duty", "50", "--quick").stdout
+    only = program("--dry-run", "--mt4g", MT4G, "--only", "latency,banks")
+    assert only.returncode == 0 and "27 configurations (3 of them baselines)" in only.stdout
 
 
 @needs_binary
 @pytest.mark.parametrize("arguments, message", [
     (["--duty", "abc"], "--duty"),
-    (["--widths", "16x"], "--widths"),
+    (["--duty", "0"], "--duty"),
+    (["--only", "texture"], "--only"),
     (["--block-size", "100"], "--block-size"),
     (["--max-power-diff", "-1"], "--max-power-diff"),
-    (["--writes", "--unroll", "6"], "--writes"),
+    (["--unroll", "6"], "--unroll"),
+    (["--validate", "all", "--profile"], "--profile"),
     (["--tune", "gemm"], "--model-file"),
     (["--tune", "gemm", "--model-file", "x", "--tune-measure", "some"], "--tune-measure"),
     (["--tune", "mixed", "--model-file", "x"], "--tune"),
@@ -678,20 +713,29 @@ def test_bad_options_are_refused(arguments, message):
 @needs_binary
 def test_analyze_reproduces_the_energy_table(tmp_path):
     """--analyze on the reference run's CSV gives the energies of its energy table again."""
-    shutil.copy(os.path.join(DATA, "Preset3.csv"), tmp_path / "Preset3.csv")
+    shutil.copy(os.path.join(DATA, "Probes.csv"), tmp_path / "Probes.csv")
     prefix = str(tmp_path / "again")
-    result = program("--analyze", str(tmp_path / "Preset3"), "--mt4g", MT4G, "--output", prefix)
+    result = program("--analyze", str(tmp_path / "Probes"), "--mt4g", MT4G, "--output", prefix)
     assert result.returncode == 0, result.stdout[-2000:]
     with open(prefix + "_energy_table.json") as file:
         again = json.load(file)
-    with open(os.path.join(DATA, "Preset3_energy_table.json")) as file:
+    with open(os.path.join(DATA, "Probes_energy_table.json")) as file:
         reference = json.load(file)
-    key = lambda f: (f["level"], f["operation"], f["width_bytes"], f["payload"])  # noqa: E731
+    key = lambda f: (f["level"], f["operation"], f["width_bytes"])  # noqa: E731
     fits = {key(f): f["pj_per_access"] for f in reference["fits"]}
     assert len(again["fits"]) == len(fits)
     for fit in again["fits"]:
         assert fit["pj_per_access"] == pytest.approx(fits[key(fit)], rel=1e-6)
     assert again["baseline"]["slope_w_per_c"] == pytest.approx(reference["baseline"]["slope_w_per_c"], rel=1e-6)
+    assert again["idle"][0]["power_w"] == pytest.approx(reference["idle"][0]["power_w"], rel=1e-6)
+    # The rows come out as they went in (energies recomputed).
+    before = counter_table.read_rows(os.path.join(DATA, "Probes.csv"))
+    after = counter_table.read_rows(prefix + ".csv")
+    assert len(after) == len(before)
+    for a, b in zip(before, after):
+        assert a["operation"] == b["operation"] and a["note"] == b["note"]
+        if a["pj_per_access"]:
+            assert float(b["pj_per_access"]) == pytest.approx(float(a["pj_per_access"]), rel=1e-6)
 
 
 # ---- SASS (slow: about 3 min; EP_SLOW=1) --------------------------------------------------------------------------------
@@ -706,119 +750,21 @@ def test_sass_checks():
 
 # ---- A real KTT output file ---------------------------------------------------------------------------------------------
 
-def test_real_ktt_output_file(model):
-    """Tune_gemm_counters.json is what KTT saved for the counter pass of a --tune run (24 Gemm configurations, RTX 3090),
-    Tune_gemm_tune.csv the program's own predictions in that run from unprofiled times. The profiled launches in the JSON
-    take up to 10 % longer, so the energies are a few percent higher; the choice is the same. The run's predictions are
-    from the model of 2026-11-12; the model with the misaligned and write-path probes (2026-11-14) differs from it by
-    -5 to +3 % on these dynamic energies."""
-    kernels = energy_predictor.from_ktt_json(os.path.join(DATA, "Tune_gemm_counters.json"))
-    assert list(kernels) == ["Gemm"] and len(kernels["Gemm"]) == 24
-    predictions = [model.predict(c, s, t, clock, label) for label, c, s, t, clock in kernels["Gemm"]]
-    choice = energy_predictor.recommend(model, predictions)
-    rows = {r["configuration"]: r for r in counter_table.read_rows(os.path.join(DATA, "Tune_gemm_tune.csv"))}
-    assert rows[predictions[choice.index].label]["choice"] == "best"
-    for p in predictions:
-        row = rows[p.label]
-        assert p.dynamic_j == pytest.approx(float(row["predicted_dynamic_j"]), rel=0.06)
-        assert p.energy_j == pytest.approx(float(row["predicted_j"]), rel=0.12)
-    # The measured best of the run is the model's choice.
-    measured = {label: float(r["measured_j"]) for label, r in rows.items()}
-    assert measured[predictions[choice.index].label] == min(measured.values())
-
-
-# ---- Search over configurations that were not profiled (2026-11-14) ------------------------------------------------------
-
-@pytest.mark.parametrize("kind", ["energy", "counters"])
-def test_energy_search_proposes_unprofiled_configurations(model, validation, kind):
-    """From 16 profiled Gemm configurations of Validation13, the surrogate ranks the other 8 (whose counters it does not
-    see): proposals are only unprofiled ones, best first, and their predicted energies are near the model's on their
-    real counters (same kernel, same work: within a factor of 2)."""
-    pytest.importorskip("sklearn")
-    import energy_search
-    rows = validation["gemm"]
-    space = [label for label, *_ in rows]
-    profiled = rows[:16]
-    proposals = energy_search.propose(model, space, [r[0] for r in profiled], [r[1] for r in profiled],
-                                      [r[2] for r in profiled], 3, kind)
-    assert len(proposals) == 3
-    assert all(label in space[16:] for label, _ in proposals)
-    assert [e for _, e in proposals] == sorted(e for _, e in proposals)
-    truth = {label: model.predict(c, s, strict=False).energy_j for label, c, s, _, _ in rows}
-    for label, energy in proposals:
-        assert 0.5 < energy / truth[label] < 2.0
-
-
-def test_energy_search_features():
-    import energy_search
-    features = energy_search.Features(["A=1 B=x C=4", "A=3 B=y C=4", "A=7 B=x C=4"])
-    assert features.names == ["A", "B"]  # C has one value
-    assert features(["A=1 B=y"]).tolist() == [[1.0, 1.0]]
-
-
-def test_energy_search_cli(tmp_path):
-    pytest.importorskip("sklearn")
-    space = tmp_path / "space.txt"
-    labels = [row["configuration"] for row in counter_table.read_rows(VALIDATION) if row["kernel"] == "gemm"]
-    space.write_text("\n".join(labels) + "\n")
-    result = tool("energy_search.py", "--model", MODEL, "--csv", VALIDATION, "--kernel", "gemm", "--space", str(space),
-                  "--count", "2", check=False)
-    # Every configuration of the space was profiled: nothing to propose, no error.
-    assert result.returncode == 0, result.stdout
-    assert result.stdout.strip() == ""
-
-
-# ---- AccelWattch import (2026-11-14) ---------------------------------------------------------------------------------------
-
-def test_accelwattch_import(tmp_path):
-    """A benchmark in AccelWattch's layout becomes a kernel awKernel under AW_BENCH with iterations from the script, its
-    dimensions from its macros, unused pointers padded, and --set variants; texture and two-kernel programs are skipped."""
-    source = tmp_path / "ubench"
-    common = ("#include <stdio.h>\n#define THREADS_PER_BLOCK 256\n#define NUM_OF_BLOCKS 640\n"
-              "#define TWICE(x) \\\n    ((x) + (x))\n")
-    main_one = ("int main(int argc, char** argv){ int iterations = atoi(argv[1]); unsigned blocks = atoi(argv[2]);\n"
-                " int N = THREADS_PER_BLOCK*NUM_OF_BLOCKS; size_t size = N * sizeof(float);\n"
-                " cudaMalloc((void**)&d_A, size); dim3 dimGrid(blocks,1); dim3 dimBlock(THREADS_PER_BLOCK,1);\n"
-                " K<<<dimGrid,dimBlock>>>(d_A, d_C, iterations); }\n")
-    files = {
-        "functional_benchmarks/ONE/ONE.cu": common + "__global__ void K(const float* A, float* C, int iterations)\n"
-            "{ float v = A[threadIdx.x]; for (int k = 0; k < iterations; ++k) v = TWICE(v); C[threadIdx.x] = v; }\n"
-            + main_one,
-        "functional_benchmarks/TEX/TEX.cu": common + "texture<float,1> t;\n__global__ void K(float* C, int n) {}\n"
-            "int main(){ K<<<1,1>>>(d_C, 1); }\n",
-        "mix_benchmarks/TWO/TWO.cu": common + "__global__ void K1(float* C, int n) {}\n__global__ void K2(float* C, int n) {}\n"
-            "int main(){ int iterations = 1; K1<<<1,1>>>(d_C, iterations); K2<<<1,1>>>(d_C, iterations); }\n",
-    }
-    for name, text in files.items():
-        (source / os.path.dirname(name)).mkdir(parents=True, exist_ok=True)
-        (source / name).write_text(text)
-    out = tmp_path / "out"
-    result = tool("accelwattch_import.py", str(source), str(out), "--set", "blocks=82,41", "--iterations", "7")
-    assert "2 benchmarks written" in result.stdout
-    assert "TEX: texture references" in result.stdout and "TWO: launches 2 kernels" in result.stdout
-    table = [line.split("\t") for line in (out / "accelwattch.tsv").read_text().splitlines() if not line.startswith("#")]
-    assert [(t[1], t[2], t[3], t[4], t[5]) for t in table] == [
-        ("functional/ONE blocks=82", "82", "256", "7", "2"), ("functional/ONE blocks=41", "41", "256", "7", "2")]
-    assert int(table[0][6]) == 16 << 20
-    kernel = (out / "AccelWattch.cu").read_text()
-    assert "#if AW_BENCH == 1" in kernel and "#define AW_ITER 7" in kernel
-    assert 'extern "C" __global__ void awKernel(const float* A, float* C, void* awUnused2, void* awUnused3)' in kernel
-    assert "const int iterations = awIterations;" in kernel and "awIterations = AW_ITER;" in kernel
-    assert "#define TWICE(x) \\\n    ((x) + (x))" in kernel
-    if shutil.which("nvcc", path=os.environ.get("PATH", "") + os.pathsep + "/usr/local/cuda/bin"):
-        nvcc = shutil.which("nvcc", path=os.environ.get("PATH", "") + os.pathsep + "/usr/local/cuda/bin")
-        compiled = subprocess.run([nvcc, "-arch=sm_86", "-DAW_BENCH=0", "-cubin", "-o", str(tmp_path / "k.cubin"),
-                                   str(out / "AccelWattch.cu")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  universal_newlines=True)
-        assert compiled.returncode == 0, compiled.stdout
+def test_real_ktt_output_file(model, validation):
+    """Ktt_gemm_counters.json is what KTT saved for the counter pass of the validation run (6 of its Gemm
+    configurations): the predictor reads it, and the dynamic energies are those from the run's CSV, which has the same
+    counters (the launch times differ: profiled launches take longer, and the time enters through the DRAM busy event)."""
+    kernels = energy_predictor.from_ktt_json(os.path.join(DATA, "Ktt_gemm_counters.json"))
+    assert list(kernels) == ["Gemm"] and len(kernels["Gemm"]) == 6  # the KTT kernel's name
+    from_csv = {label: model.predict(row, seconds, strict=False) for label, row, seconds, _, _ in validation["gemm"]}
+    for label, counters, seconds, temperature, clock in kernels["Gemm"]:
+        p = model.predict(counters, seconds, temperature, clock, label)
+        assert p.dynamic_j == pytest.approx(from_csv[label].dynamic_j, rel=0.05)
+    result = tool("energy_predictor.py", "--model", MODEL, "--ktt", os.path.join(DATA, "Ktt_gemm_counters.json"))
+    assert "use: " in result.stdout
 
 
 @needs_binary
-def test_accelwattch_is_a_validation_name():
-    assert "accelwattch" in program("--validate", "bogus").stdout
-    assert "--accelwattch-dir" in program("--help").stdout
-
-
 def test_cpp_kernel_scale_equals_python(tmp_path, validation):
     """KernelScale in C++ and kernel_scale in Python: the same scale, the same scaled dynamic energy and the same pair sd
     against another kernel (the residual bias of a scaled kernel), and no compounding on a second call."""
@@ -870,37 +816,3 @@ int main(int, char** argv)
     other = python.predict(cb, sb, tb, strict=False, group="b")
     assert scaled.dynamic_j == pytest.approx(dynamic, rel=1e-9)
     assert python.pair_sd(scaled, other) == pytest.approx(pair, rel=1e-9)
-
-
-def test_fit_stability_report():
-    """tools/fit_stability.py (NEXT_STEPS_PLAN P4) on the test runs: prices with their CV, per-kernel stability and the
-    families left out."""
-    result = tool("fit_stability.py", "--power", "Preset3", "--counters", "ProfileModel1,ProfileNew2", "--full-rate",
-                  "MisalignedWrite2", "--validation", "Validation13", "--resamples", "20")
-    assert "stability: kernel means" in result.stdout and "within-kernel" in result.stdout
-    assert "DRAM read sector" in result.stdout and "one family left out" in result.stdout
-
-
-def test_fit_thermal_load_recovers_a_slope(tmp_path):
-    """tools/fit_thermal_load.py (NEXT_STEPS_PLAN M1) on a synthetic trace: the sleep baseline rises 0.3 W/K, a probe
-    0.3 + 0.8 W/K; temperatures run up (cool start) and down (hot start), with a drift in time that the fit separates."""
-    lines = ["configuration,time_s,power_w,instant_power_w,average_power_w,energy_j,sm_clock_mhz,memory_clock_mhz,"
-             "temperature_c,fan_pct,reasons"]
-    clock = 0.0
-    for name, base, slope in (("Hold_sleep_cool", 115.0, 0.3), ("Hold_sleep_hot", 115.0, 0.3),
-                              ("Hold_ffma3_d100_cool", 200.0, 1.1), ("Hold_ffma3_d100_hot", 200.0, 1.1)):
-        energy = 0.0
-        for k in range(900):  # 90 s at 100 ms
-            t = k * 0.1
-            temperature = 60 + 10 * (1 - math.exp(-t / 30)) if name.endswith("cool") else 75 - 8 * (1 - math.exp(-t / 30))
-            power = base + slope * (temperature - 65) + 0.01 * t
-            energy += power * 0.1
-            lines.append(f"{name},{clock + t:.3f},{power:.3f},{power:.3f},{power:.3f},{energy:.4f},1200,9501,"
-                         f"{round(temperature)},50,")
-        clock += 200
-    (tmp_path / "T_trace.csv").write_text("\n".join(lines) + "\n")
-    result = tool("fit_thermal_load.py", str(tmp_path / "T"))
-    sleep = re.search(r"Sleep baseline: b = ([+-][0-9.]+)", result.stdout)
-    assert sleep and float(sleep.group(1)) == pytest.approx(0.3, abs=0.06), result.stdout
-    excess = re.search(r"Excess slope of the probes \(b - b_sleep\): mean ([+-][0-9.]+)", result.stdout)
-    assert excess and float(excess.group(1)) == pytest.approx(0.8, abs=0.1), result.stdout

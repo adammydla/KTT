@@ -296,12 +296,12 @@ std::string ExpectedLevel(const uint64_t operation, const uint64_t footprint, co
         return footprint <= l2Limit ? "L2" : (footprint >= dramLimit ? "DRAM" : "mixed");
     }
 
-    if (operation != LoadCg && footprint <= l1Limit)
+    if (footprint <= l1Limit)
     {
         return "L1";
     }
 
-    if (footprint <= l2Limit && (operation == LoadCg || footprint >= 4 * hardware.l1Size.value_or(footprints.l1)))
+    if (footprint <= l2Limit && footprint >= 4 * hardware.l1Size.value_or(footprints.l1))
     {
         return "L2";
     }

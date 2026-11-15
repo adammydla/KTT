@@ -1,5 +1,5 @@
 // Sub-sector accesses (probePartial). Parameters LOAD_OP (0 or 5) and WIDTH (4 or 8) as in Global.cu; the footprint and
-// the placement of the sectors are runtime arguments. PARTIAL_WORDS (--write-path, 2026-11-13): the words a thread
+// the placement of the sectors are runtime arguments. PARTIAL_WORDS (the write-path probes): the words a thread
 // accesses in each of its sectors before it moves on (default all, 32 / WIDTH; fewer leave the rest of the sector
 // untouched, as a partial write of a sector).
 

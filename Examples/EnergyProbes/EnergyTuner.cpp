@@ -9,7 +9,14 @@
 namespace
 {
 
-double Value(const ktt::KernelProfilingCounter& counter)
+void Note(std::string& note, const std::string& text)
+{
+    note += (note.empty() ? "" : "; ") + text;
+}
+
+} // namespace
+
+double CounterValue(const ktt::KernelProfilingCounter& counter)
 {
     switch (counter.GetType())
     {
@@ -22,13 +29,6 @@ double Value(const ktt::KernelProfilingCounter& counter)
         return static_cast<double>(counter.GetValueUint());
     }
 }
-
-void Note(std::string& note, const std::string& text)
-{
-    note += (note.empty() ? "" : "; ") + text;
-}
-
-} // namespace
 
 EnergyTuner::EnergyTuner(ktt::Tuner& tuner, PowerMeter meter) :
     m_Tuner(tuner),
@@ -156,7 +156,7 @@ std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<s
             {
                 for (const auto& counter : result.GetResults()[0].GetProfilingData().GetCounters())
                 {
-                    row.counters[counter.GetName()] = Value(counter);
+                    row.counters[counter.GetName()] = CounterValue(counter);
                 }
 
                 profiled.push_back(result);

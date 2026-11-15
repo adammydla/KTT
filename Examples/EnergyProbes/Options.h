@@ -19,86 +19,62 @@ inline const std::string defaultKernelDirectory = kernelPrefix + "../Examples/En
 
 struct Options
 {
+    // The GPU and the files.
     ktt::PlatformIndex platform = 0;
     ktt::DeviceIndex device = 0;
-    std::string kernelDirectory = defaultKernelDirectory; // the probe files (kernels/)
-    std::string counterTable = defaultKernelDirectory + "../tools/counters.json"; // the CUPTI counters (--profile)
+    std::string kernelDirectory = defaultKernelDirectory;
+    std::string counterTable = defaultKernelDirectory + "../tools/counters.json"; // the CUPTI counters to collect
     std::string mt4gFile;
     std::string outputPrefix = "EnergyProbes";
+    std::optional<uint64_t> l1Override;
+    std::optional<uint64_t> l2Override;
+
+    // What runs: the probes (default), --validate, --tune, --predict, --analyze or --dry-run.
+    std::vector<std::string> only;     // --only: probe groups to run (empty = all)
+    bool profile = false;              // --profile: the counter run (CUPTI counters of every probe)
+    std::vector<std::string> validate; // --validate: KTT example kernels to measure instead of the probes
+    uint64_t validateConfigs = 24;     // random configurations per kernel
+    uint64_t validateMs = 4000;        // measurement time per configuration
+    std::vector<std::string> tune;     // --tune: example kernels to tune with the energy model
+    std::string modelFile;             // --model-file: the model for --tune and --predict (tools/build_model.py)
+    std::string predictCsv;            // --predict: a --validate run's CSV to predict without a GPU
+    std::string analyzePrefix;         // --analyze: analyse the CSV of an earlier run instead of measuring
+    bool dryRun = false;
+
+    // The recommendation of --tune and --predict.
+    std::string objective = "energy";           // energy, edp, ed2p or time
+    std::optional<double> maxSlowdownPct;       // only configurations at most this much slower than the fastest
+    std::optional<double> maxEnergyIncreasePct; // only those at most this much above the lowest energy
+    std::string accounting = "awake";           // awake, above-idle or dynamic (which baseline the energy includes)
+    std::optional<double> idleW;                // the idle power for above-idle (default: the model file's)
+    double contenderSd = 2.0;                   // configurations within this many sd of the best are contenders
+    std::string tuneMeasure = "none";           // none, contenders or all (NVML power of the candidates)
+    std::optional<uint64_t> tuneScaleConfigs;   // default: 5 with more than one kernel, else 0
+    double measureMarginPct = 1.0;              // measured candidates this close to the best are not told apart
+    bool lenient = false;                       // counters the model needs and does not find become warnings
+
+    // The measurement.
+    std::vector<uint64_t> duties{100, 25}; // percent of time issuing accesses; the fit across them gives the energy
+    uint64_t fitMinDuty = 25;              // lowest duty used in the fit
     uint64_t launchMs = 200;
     uint64_t minTimeMs = 10000;
     uint64_t maxTimeMs = 60000;
     double maxPowerDiff = 0.02;
+    uint64_t warmupS = 120;
+    uint64_t idleS = 20; // idle power without a kernel: before KTT starts, before the warm-up and at the end
+    uint64_t traceIntervalMs = 50;
+    bool randomOrder = true;
+    bool forceEnergy = false;
+    bool monitor = true;
+    std::optional<uint32_t> lockClockMHz;
+    bool clockLockedExternally = false; // locked with nvidia-smi -lgc by someone else
+
+    // The shape of the probes.
     uint64_t blockSize = 256;
     uint64_t blocksPerSm = 4;
     uint64_t unroll = 16;
-    uint64_t burstAccesses = 64; // accesses per thread between two sleeps at duty below 100
+    uint64_t burstAccesses = 64; // accesses per thread between two sleeps
     uint64_t sharedBytes = 8 * KiB;
-    uint64_t warmupS = 120;
-    uint64_t traceIntervalMs = 50;
-    std::optional<uint32_t> lockClockMHz;
-    std::vector<uint64_t> duties; // percent of time issuing accesses
-    uint64_t fitMinDuty = 25;     // lowest duty used in the fit across intensities
-    std::vector<uint64_t> payloads{PayloadRandom};
-    std::vector<std::string> payloadBits; // --payload-bits: patterns of Payloads.h
-    std::vector<uint64_t> widths{DefaultWidth}; // bytes per access of the global loads
-    std::vector<uint64_t> smSweep;              // active SM counts of the SM sweep (empty = off)
-    bool smSweepAuto = false;                   // --all: SM sweep over all SMs, halves, ..., 1
-    bool sweepStudies = true;                   // SM sweep with its L1, L2, no-load, shared (and FFMA) probes; --model:
-                                                // only the baselines and the dependent loads, which the model uses
-    bool compute = false;
-    bool atomics = false;  // global and shared atomics (and the 4-byte loads and stores they are compared with)
-    bool constant = false; // constant-memory loads at the constant L1 and L1.5 footprints
-    bool texture = false;  // texture fetches at the L1, L2 and DRAM footprints
-    bool dramLocality = false; // DRAM loads and stores whose runs of consecutive lines are scattered (row locality)
-    bool subSector = false;    // 4- and 8-byte accesses, one word of 32 sectors per warp instruction (partial sectors)
-    bool indexing = false;     // FFMA accumulators with static vs runtime register-array indices (guarded moves)
-    bool bankConflicts = false; // 32-bit shared loads and stores with 1- to 32-way bank conflicts
-    bool mixed = false;         // 16-byte loads with 0 to 1024 FFMAs each (arithmetic intensity, as Mixbench)
-    bool writes = false;        // loads and stores together: copy, update in place, local memory
-    bool latency = false;       // dependent loads at low memory-level parallelism
-    uint64_t idleS = 20; // idle power measurement without a kernel, before the warm-up and at the end
-    std::optional<uint64_t> l1Override;
-    std::optional<uint64_t> l2Override;
-    bool sweep = false;
-    bool randomOrder = true;
-    bool profile = false;
-    std::vector<std::string> validate; // KTT example kernels to measure instead of the probes (--validate)
-    uint64_t validateConfigs = 24;     // random configurations per kernel
-    uint64_t validateMs = 4000;        // measurement time per configuration
-    uint64_t validateRepeat = 1;       // --validate-repeat: power measurements per configuration, in rounds over all kernels
-    std::optional<uint64_t> validateSeed; // --validate-seed: the same configurations in every run with this seed
-    std::string validateData = "random"; // --validate-data: random, zero or small (the example kernels' inputs)
-    double validateSizeScale = 1.0;    // --validate-size-scale: gemm's and convolution's sizes times this
-    std::string accelwattchDirectory;  // --accelwattch-dir: the output of tools/accelwattch_import.py
-    std::vector<std::string> tune;     // --tune: example kernels to tune with the energy model (no power measurement)
-    std::string modelFile;             // --model-file: the model for --tune and --predict (tools/build_model.py)
-    std::string predictCsv;            // --predict: a --validate run's CSV to predict without a GPU
-    std::string objective = "energy";  // --objective: energy, edp, ed2p or time
-    std::optional<double> maxSlowdownPct; // --max-slowdown: only configurations at most this much slower than the fastest
-    std::optional<double> maxEnergyIncreasePct; // --max-energy-increase: only those at most this much above the lowest energy
-    std::string accounting = "awake";  // --accounting: awake, above-idle or dynamic (which baseline the energy includes)
-    std::optional<double> idleW;       // --idle-w: the idle power for --accounting above-idle (default: the model file's)
-    double contenderSd = 2.0;          // --contender-sd: configurations within this many sd of the best are contenders
-    std::optional<uint64_t> tuneScaleConfigs; // --tune-scale-configs (default: 5 with more than one kernel, else 0)
-    std::string tuneMeasure = "none";  // --tune-measure: none, contenders or all (NVML power of the candidates)
-    double measureMarginPct = 1.0;     // --measure-margin: measured candidates this close to the best are not told apart
-    bool lenient = false;              // --lenient: counters the model needs and does not find become warnings
-    bool dryRun = false;
-    bool thermalCurve = false;
-    bool thermalLoad = false;
-    bool studyCounters = false;
-    bool mixedInt = false;
-    bool l1Sweep = false;              // --l1-sweep: L1 loads and stores with 1-32 sectors in 1-32 lines per instruction (M2)             // --mixed-int: loads with 0-16 address-like integer instructions per load (M2)        // --study-counters: also the screening counters of tools/counters.json          // --thermal-load: power over temperature under load (NEXT_STEPS_PLAN M1)
-    uint64_t thermalHoldS = 90;        // --thermal-hold: seconds each probe is held in --thermal-load
-    bool lanes = false;
-    bool instrClasses = false; // --instr-classes: LOP3, SHF, IMNMX, FADD, FMUL and MUFU variants
-    bool writePath = false;  // --write-path: 1, 2, 4 or 8 words of a sector x 1, 2 or 4 sectors per L2 request
-    bool misaligned = false; // --misaligned: the 16- and 4-byte stream load and store started off the 128-byte line // --lanes: FFMA and IADD with 1 to 32 active lanes per warp (predicate and branch) // --thermal-curve: the baseline's power over temperature, not the probes
-    std::string analyzePrefix; // --analyze: analyse the CSV of an earlier run instead of measuring
-    bool forceEnergy = false;
-    bool clockLockedExternally = false; // locked with nvidia-smi -lgc by someone else
-    bool monitor = true;
 };
 
 bool ClockIsLocked(const Options& options);

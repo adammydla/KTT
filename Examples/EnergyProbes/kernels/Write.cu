@@ -185,7 +185,7 @@ extern "C" __global__ void probeWrite(Element* __restrict__ data, u32* __restric
         }
 
         // Whole groups only: with an UNROLL that is not a multiple of WRITE_GROUP the loop above issues fewer accesses than
-        // UNROLL (the host refuses such an --unroll with --writes; the same constant for the default).
+        // UNROLL (the host refuses such an --unroll).
         iterations += (UNROLL / WRITE_GROUP) * WRITE_GROUP;
         now = globalTimer();
         IdleForDuty(idleRatio, burstIterations, burstStart, now);

@@ -72,8 +72,7 @@ extern "C" __global__ void probeGlobal(Element* __restrict__ data, u32* __restri
 
 #if WRITES_WORDS
     // Stored words (and the atomics' operands): the XOR recurrence s[n+4] = s[n] ^ s[n+1] (primitive over GF(2), period 15
-    // per bit), one instruction per store like the XOR of the loads. It starts from the payload, so a zero payload stores
-    // zeros (and the atomics add zeros to zeros).
+    // per bit), one instruction per store like the XOR of the loads. It starts from the payload.
     const uint4 seed = reinterpret_cast<const uint4*>(data)[blockIdx.x * BLOCK_SIZE + threadIdx.x];
     u32 s0 = seed.x;
     u32 s1 = seed.y;

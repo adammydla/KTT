@@ -5,7 +5,7 @@
 // how many accesses (or operations) it issued. Block b adds its count to counts[b] and its active time to
 // counts[gridDim.x + b], and block 0 counts the launch in counts[3 * gridDim.x]. The host clears the buffer before the
 // launches of a configuration, so after KTT's repeated launches it holds sums over all of them. The probes that split
-// their footprint by SM (probeGlobal, probeTexture, probeConstant) also write their SM id and slot into
+// their footprint by SM (probeGlobal, probeWrite, probeConstant) also write their SM id and slot into
 // counts[2 * gridDim.x + b] (overwritten on every launch).
 //
 // Tuning parameters shared by several probes (injected by KTT as #defines; each probe file lists its own):

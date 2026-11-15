@@ -50,46 +50,29 @@ def resident_blocks(registers, block_size=None, blocks_per_sm=None):
 
 
 def variants():
-    """(file, function, parameters, footprint sweep of SWEEPS or None) of every variant the host compiles."""
+    """(file, function, parameters, footprint sweep of SWEEPS or None) of every variant the host compiles (ProbePlan.cpp).
+    Arguments that only name a configuration (duty, offsets, conflict degree, runs) do not change the code."""
     result = [("Baseline.cu", "probeSleep", {}, None), ("Baseline.cu", "probeSpin", {}, None)]
-    for op, width in itertools.product(range(6), [4, 8, 16]):
+    for op, width in itertools.product([0, 2, 5], [4, 8, 16]):
         result.append(("Global.cu", "probeGlobal", {"LOAD_OP": op, "WIDTH": width}, "FOOTPRINT"))
     for op in [6, 7]:
         result.append(("Global.cu", "probeGlobal", {"LOAD_OP": op, "WIDTH": 4}, "FOOTPRINT"))
-    result.append(("Texture.cu", "probeTexture", {}, "FOOTPRINT"))
-    # The FFMAs per load are an argument; MIX_FMAS only names the configuration, so one value stands for all.
-    result.append(("Mixed.cu", "probeMixed", {"WIDTH": 16, "MIX_FMAS": 0}, "FOOTPRINT"))
-    result.append(("Mixed.cu", "probeMixed", {"WIDTH": 16, "MIX_FMAS": 0, "MIX_OP": 1}, "FOOTPRINT"))  # --mixed-int
-    for op, width in itertools.product([0, 5], [4, 16]):  # --l1-sweep
-        for sectors, lines in [(1, 1), (2, 1), (4, 1), (4, 4), (8, 4), (16, 4), (32, 32)]:
-            result.append(("L1Sweep.cu", "probeL1Sweep", {"LOAD_OP": op, "WIDTH": width, "SWEEP_SECTORS": sectors,
-                                                          "SWEEP_LINES": lines}, None))
     for op in [0, 5]:
         result.append(("Scatter.cu", "probeScatter", {"LOAD_OP": op, "WIDTH": 16}, "FOOTPRINT"))
         for width in [4, 8]:
             result.append(("Partial.cu", "probePartial", {"LOAD_OP": op, "WIDTH": width}, "FOOTPRINT"))
-        for words in [1, 2, 4]:  # --write-path (8 words is the default above)
-            result.append(("Partial.cu", "probePartial", {"LOAD_OP": op, "WIDTH": 4, "PARTIAL_WORDS": words}, "FOOTPRINT"))
+        result.append(("Partial.cu", "probePartial", {"LOAD_OP": op, "WIDTH": 4, "PARTIAL_WORDS": 1}, "FOOTPRINT"))
     for op in [0, 1, 2]:
         result.append(("Shared.cu", "probeShared", {"SHARED_OP": op, "SMEM_BYTES": 8192}, None))
-    for op in [0, 1]:
-        result.append(("Shared.cu", "probeSharedBanks", {"SHARED_OP": op, "SMEM_BYTES": 8192}, None))
-        for width in [8, 16]:
-            result.append(("Shared.cu", "probeSharedBanks", {"SHARED_OP": op, "SMEM_BYTES": 8192, "SHARED_WIDTH": width},
-                           None))
+    for op, width in itertools.product([0, 1], [4, 16]):
+        result.append(("Shared.cu", "probeSharedBanks", {"SHARED_OP": op, "SMEM_BYTES": 8192, "SHARED_WIDTH": width}, None))
     result.append(("Constant.cu", "probeConstant", {}, "CONST_BYTES"))
-    for op in range(15):
+    for op in [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12]:
         result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op}, None))
-    for op in range(19, 34):  # --instr-classes
-        result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op}, None))
-    for op, lanes in itertools.product(list(range(15, 19)) + [34], [0, 1, 32]):  # --lanes
-        result.append(("Compute.cu", "probeCompute", {"COMPUTE_OP": op, "LANES": lanes}, None))
-    for op, width in itertools.product(range(3), [4, 8, 16]):
+    for op, width in itertools.product(range(3), [4, 16]):
         result.append(("Write.cu", "probeWrite", {"WRITE_OP": op, "WIDTH": width}, "LOCAL" if op == 2 else "FOOTPRINT"))
-    for chains in [1, 4, 16]:
+    for chains in [1, 16]:
         result.append(("Latency.cu", "probeLatency", {"CHAINS": chains, "WIDTH": 4}, "FOOTPRINT"))
-    for op in range(3):
-        result.append(("Operands.cu", "probeOperands", {"OPERAND_OP": op}, None))
     return result
 
 
@@ -194,8 +177,6 @@ def main():
             checked = 0
             for file, function, parameters, footprint in variants():
                 if function == "probeCompute" and parameters["COMPUTE_OP"] == 5 and int(arch) < 70:
-                    continue
-                if function == "probeOperands" and parameters["OPERAND_OP"] == 2 and int(arch) < 80:
                     continue
                 name, values = SWEEPS[footprint] if footprint else (None, [None])
                 compiled = []

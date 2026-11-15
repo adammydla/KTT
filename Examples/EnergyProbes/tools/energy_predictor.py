@@ -78,12 +78,12 @@ REQUIRED_KEYS = (("device",), ("options",), ("events",), ("baseline", "mean_w"),
                  ("baseline", "slope_w_per_c"), ("uncertainty", "dynamic_relative_sd"), ("counters", "required"),
                  ("counters", "lsu_shared"), ("counters", "lsu_global"), ("counters", "aliases"))
 
-# Optional counters the events use when a GPU has them (lane counts, the fp16 pipe of Turing and GA100, the fma halves).
-# Model files from before 2026-11-13 do not list them; the same names as EnergyModel.cpp then.
+# Optional counters the events use when a GPU has them (lane counts, the fp16 pipe of Turing and GA100); the same names
+# as EnergyModel.cpp, for model files that do not list them.
 OPTIONAL_COUNTERS = ("sm__thread_inst_executed_pipe_alu_pred_on.sum", "sm__thread_inst_executed_pipe_fma_pred_on.sum",
                      "sm__thread_inst_executed_pipe_fp16_pred_on.sum",
                      "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum", "smsp__inst_executed_pipe_fp16.sum",
-                     "smsp__inst_executed_pipe_fma_type_fp16.sum", "sm__thread_inst_executed_pipe_fmalite_pred_on.sum")
+                     "smsp__inst_executed_pipe_fma_type_fp16.sum")
 
 
 class ModelError(Exception):
@@ -212,9 +212,8 @@ class Model:
         return result
 
     def events(self, counters, kernel_s):
-        counts = energy_events.events(self._canonical(counters), fma_halves=bool(self.options.get("fma_halves")))
-        return energy_events.add_busy(counts, kernel_s * 1e9, busy=bool(self.options.get("busy", True)),
-                                      scale_gbs=float(self.options.get("busy_scale_gbs", energy_events.BUSY_SCALE_GBS)))
+        return energy_events.add_busy(energy_events.events(self._canonical(counters)), kernel_s * 1e9,
+                                      float(self.options.get("busy_scale_gbs", energy_events.BUSY_SCALE_GBS)))
 
     def predict(self, counters, kernel_s, temperature_c=None, sm_clock_mhz=None, label=None, strict=True, group=None,
                 device_name=None):

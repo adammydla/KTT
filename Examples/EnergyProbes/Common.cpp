@@ -2,87 +2,28 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
-#include <iterator>
 #include <sstream>
 
 #include "Common.h"
-#include "Payloads.h"
 
-std::string PayloadName(const uint64_t payload)
+std::string OperationName(const uint64_t loadOp)
 {
-    if (payload >= PayloadPatternFirst && payload - PayloadPatternFirst < PayloadPatterns().size())
+    switch (loadOp)
     {
-        return PayloadPatterns()[payload - PayloadPatternFirst];
+    case LoadDefault: return "ld";
+    case LoadNone: return "no-load";
+    case StoreDefault: return "st";
+    case AtomicRed: return "red";
+    case AtomicAdd: return "atom";
+    default: return "?";
     }
-
-    return payload == PayloadZero ? "zero" : "random";
 }
 
-std::string OperandName(const uint64_t operation)
-{
-    const std::vector<std::string> names = {"ffma-bits", "dfma-bits", "hmma-bits"};
-    return operation < names.size() ? names[operation] : "?";
-}
-
-std::string ComputeName(const uint64_t operation)
+std::string ComputeName(const uint64_t computeOp)
 {
     const std::vector<std::string> names = {"loop", "ffma", "dfma", "imad", "hfma2", "hmma", "mufu", "ffma-static",
-        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop", "fmul-fadd", "mufu-sin", "ffma-pred", "ffma-branch", "iadd-pred",
-        "iadd-branch", "lop3-xor", "shf-rotate", "imnmx-xor", "fadd", "fmul", "ffma-rcp-fadd", "ffma-sqrt-fadd", "ffma-ex2-fadd",
-        "ffma-lg2-fadd", "ffma-rsq-fadd", "isetp-sel", "fsetp-sel", "cvt-i2f-f2i", "fmnmx", "iadd3", "ffma-pred-rotating"};
-    return operation < names.size() ? names[operation] : "?";
-}
-
-double FlopsPerOperation(const uint64_t operation, const uint32_t computeCapabilityMajor)
-{
-    switch (operation)
-    {
-    case ComputeFfma:
-    case ComputeDfma:
-    case ComputeImad:
-    case ComputeStaticIndex:
-    case ComputeDynamicIndex:
-    case ComputeFfma3:
-    case ComputeFfmaLoop:
-    case ComputeFmulFadd:
-        return 2.0;
-    case ComputeFfmaLanes:
-    case ComputeFfmaLanesBranch:
-    case ComputeFfmaLanesRotating:
-        return NaN; // counted per thread, active or not
-    case ComputeHfma2:
-        return 4.0; // two FMAs on half2
-    case ComputeHmma:
-        // m16n8k16 per warp from sm_80 (4096 FLOPs), m16n8k8 on sm_75 and 4 x m8n8k4 on sm_70 (2048), shared by 32 threads
-        return computeCapabilityMajor >= 8 || computeCapabilityMajor == 0 ? 2.0 * 16 * 8 * 16 / 32 : 2.0 * 16 * 8 * 8 / 32;
-    default: // MUFU (rsqrt or sin, plus an FFMA), SHFL and BAR count no FLOPs
-        return NaN;
-    }
-}
-
-std::string OperationName(const uint64_t operation)
-{
-    switch (operation)
-    {
-    case LoadDefault:
-        return "ld";
-    case LoadCg:
-        return "ld.cg";
-    case LoadNone:
-        return "no-load";
-    case LoadCa:
-        return "ld.ca";
-    case LoadNc:
-        return "ld.nc";
-    case StoreDefault:
-        return "st";
-    case AtomicRed:
-        return "red";
-    case AtomicAdd:
-        return "atom";
-    default:
-        return "?";
-    }
+        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop"};
+    return computeOp < names.size() ? names[computeOp] : "?";
 }
 
 bool IsPowerOfTwo(const uint64_t value)
@@ -116,26 +57,15 @@ uint64_t CeilPowerOfTwo(const uint64_t value)
 
 std::string FormatBytes(const uint64_t bytes)
 {
-    std::ostringstream stream;
-
-    if (bytes >= GiB && bytes % GiB == 0)
+    for (const auto& [unit, name] : {std::pair{GiB, " GiB"}, std::pair{MiB, " MiB"}, std::pair{KiB, " KiB"}})
     {
-        stream << bytes / GiB << " GiB";
-    }
-    else if (bytes >= MiB && bytes % MiB == 0)
-    {
-        stream << bytes / MiB << " MiB";
-    }
-    else if (bytes >= KiB && bytes % KiB == 0)
-    {
-        stream << bytes / KiB << " KiB";
-    }
-    else
-    {
-        stream << bytes << " B";
+        if (bytes >= unit && bytes % unit == 0)
+        {
+            return std::to_string(bytes / unit) + name;
+        }
     }
 
-    return stream.str();
+    return std::to_string(bytes) + " B";
 }
 
 std::string Fixed(const double value, const int precision)
@@ -202,53 +132,37 @@ uint32_t FloatBits(const float value)
     return bits;
 }
 
-std::vector<uint64_t> BankWaysOfWidth(const uint64_t width)
+Line FitLine(const std::vector<std::pair<double, double>>& points)
 {
-    std::vector<uint64_t> ways;
-    std::copy_if(BankWays.cbegin(), BankWays.cend(), std::back_inserter(ways),
-        [width](const uint64_t degree) { return degree * width <= WavefrontBytes; });
-    return ways;
-}
+    Line line;
+    const double n = static_cast<double>(points.size());
+    double meanX = 0.0;
+    double meanY = 0.0;
 
-std::string MixedName(const uint64_t fmasPerLoad)
-{
-    return "ld-ffma" + std::to_string(fmasPerLoad);
-}
-
-std::string WriteName(const uint64_t operation)
-{
-    switch (operation)
+    for (const auto& [x, y] : points)
     {
-    case WriteCopy:
-        return "copy";
-    case WriteUpdate:
-        return "update";
-    case WriteLocal:
-        return "local";
-    default:
-        return "write" + std::to_string(operation);
-    }
-}
-
-std::string LatencyName(const uint64_t chains, const uint64_t warpsPerSm)
-{
-    return "chase-c" + std::to_string(chains) + "-w" + std::to_string(warpsPerSm);
-}
-
-bool IsWriteOperation(const std::string& operation)
-{
-    return operation == "copy" || operation == "update" || operation == "local";
-}
-
-std::optional<uint64_t> MixedFmasOf(const std::string& operation)
-{
-    const std::string prefix = "ld-ffma";
-
-    if (operation.size() <= prefix.size() || operation.compare(0, prefix.size(), prefix) != 0
-        || operation.find_first_not_of("0123456789", prefix.size()) != std::string::npos)
-    {
-        return std::nullopt;
+        meanX += x / n;
+        meanY += y / n;
     }
 
-    return std::stoull(operation.substr(prefix.size()));
+    double sxx = 0.0;
+    double sxy = 0.0;
+    double syy = 0.0;
+
+    for (const auto& [x, y] : points)
+    {
+        sxx += (x - meanX) * (x - meanX);
+        sxy += (x - meanX) * (y - meanY);
+        syy += (y - meanY) * (y - meanY);
+    }
+
+    if (points.size() < 2 || sxx <= 0.0)
+    {
+        return line;
+    }
+
+    line.slope = sxy / sxx;
+    line.intercept = meanY - line.slope * meanX;
+    line.r2 = points.size() >= 3 && syy > 0.0 ? sxy * sxy / (sxx * syy) : NaN;
+    return line;
 }

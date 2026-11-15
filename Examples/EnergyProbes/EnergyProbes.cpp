@@ -1,47 +1,20 @@
 /******************************************************************************
- * Energy probes -- prototype for estimating the energy of a single access served
- * by L1, L2, DRAM or shared memory (loads and stores), and of one arithmetic
- * operation (FFMA, DFMA, IMAD, HFMA2, HMMA).
+ * Energy probes: the energy of one memory access (loads, stores and atomics served by L1, L2, DRAM, shared and constant
+ * memory) and of one arithmetic operation on an NVIDIA GPU, measured with KTT's NVML power readings, and from them an
+ * energy model per CUPTI event that prices a kernel configuration from its counters and its time (EnergyModel.h), so
+ * that a tuner can pick the configuration that uses the least energy without measuring power.
  *
- * Every probe keeps one part of the GPU busy on all SMs for a fixed time. KTT
- * measures board power (NVML) while the probe is repeated until the reading is
- * stable, and the kernel counts the accesses it issued. Energy per access is
- * (P_probe - P_baseline) * t / accesses. The baseline is a kernel whose warps
- * sleep: the GPU is awake at the same clock but issues almost nothing.
+ * Every probe keeps one part of the GPU busy on all SMs for a fixed time while KTT measures the board power, and counts
+ * the accesses it issued. Energy per access is the slope of the power above a baseline over the access rate, across
+ * duties. The baseline is a kernel whose warps sleep: the GPU is awake at the same clock but issues almost nothing.
  *
- * Optional studies, following published GPU energy models:
- *   - zero vs random data: control vs datapath energy (Antepara et al., SC '25)
- *   - access widths of 4, 8 and 16 bytes: energy per request vs per byte
- *     (Wattchmen, ICS '26)
- *   - number of active SMs: power of awake and active SMs, chip-wide power
- *     (AccelWattch, MICRO '21)
- *   - idle power without any kernel: constant vs static power (Wattchmen)
- *
- * The program also talks to NVML directly: it can lock the GPU clock, records a
- * power / clock / temperature trace for every configuration, reports why the GPU
- * limited its clock, and cross-checks KTT's power with NVML's energy counter and
- * its instant and 1 s average power fields.
- *
- * Cache sizes are taken from an MT4G result file (--mt4g), otherwise from
- * conservative defaults. Requires KTT built with --power-usage.
- * See README.md (the tuner's side), docs/CALIBRATION.md (measuring a GPU) and docs/FINDINGS.md (results).
+ * Modes: the probes (default; --profile for their CUPTI counters), --validate (example kernels measured the same way,
+ * for the model's uncertainty), --tune and --predict (the model used as a tuner uses it), --analyze, --dry-run.
+ * See README.md. Requires KTT built with --power-usage and --profiling=cupti.
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
-#include <map>
-#include <optional>
-#include <set>
-#include <sstream>
 #include <stdexcept>
-#include <string>
-#include <tuple>
-#include <utility>
-#include <vector>
 
 #include "Analysis.h"
 #include "Hardware.h"
@@ -50,72 +23,40 @@
 #include "ProbeRun.h"
 #include "Report.h"
 #include "Rows.h"
-#include "Studies.h"
 #include "Tune.h"
 #include "Validation.h"
 
 namespace
 {
 
-// --analyze: the analysis of an earlier run again, from its CSV. Cache sizes and the SM count come from the MT4G file as in
-// --dry-run; the payloads, widths and duties of the studies from the rows themselves.
-int AnalyzeRun(const Options& options)
+// The GPU from the MT4G file alone, for the modes that do not touch one.
+Hardware HardwareFromFile(const Options& options, const std::string& mode)
 {
     if (options.mt4gFile.empty())
     {
-        throw std::runtime_error("--analyze needs --mt4g");
+        throw std::runtime_error(mode + " needs --mt4g");
     }
 
     Hardware hardware;
     ApplyOverrides(hardware, options);
-    const Footprints footprints = ChooseFootprints(hardware, options);
+    return hardware;
+}
+
+// --analyze: the analysis of an earlier run again, from its CSV.
+int AnalyzeRun(const Options& options)
+{
+    const Hardware hardware = HardwareFromFile(options, "--analyze");
     std::vector<Row> rows = ReadCsv(options.analyzePrefix + ".csv");
-
-    Options measured = options;
-    std::set<uint64_t> payloads;
-    std::set<uint64_t> widths;
-    std::set<uint64_t> duties;
-
-    for (const auto& row : rows)
-    {
-        if (!IsProbeRow(row))
-        {
-            continue;
-        }
-
-        payloads.insert(row.payload == PayloadName(PayloadZero) ? PayloadZero : PayloadRandom);
-        duties.insert(row.duty);
-
-        if (row.probe == "global" && row.operation == "ld")
-        {
-            widths.insert(row.width);
-        }
-    }
-
-    // In the order ParseOptions leaves them: payloads random first, widths and duties from the largest.
-    measured.payloads.assign(payloads.cbegin(), payloads.cend());
-    measured.widths.assign(widths.crbegin(), widths.crend());
-    measured.duties.assign(duties.crbegin(), duties.crend());
-
-    const BaselineModel baseline = FitBaseline(rows);
-    ReportProbeRun(rows, baseline, footprints, hardware, measured, nullptr);
-    std::cout << "\nWrote " << measured.outputPrefix << ".csv, " << measured.outputPrefix << "_fits.csv and "
-        << measured.outputPrefix << "_energy_table.json from " << options.analyzePrefix << ".csv\n";
+    ReportProbeRun(rows, FitBaseline(rows), hardware, options, nullptr);
     return 0;
 }
 
-// Prints the plan from an MT4G file without touching a GPU.
+// --dry-run: the plan, without touching a GPU.
 int DryRun(const Options& options)
 {
-    if (options.mt4gFile.empty())
-    {
-        throw std::runtime_error("--dry-run needs --mt4g");
-    }
-
-    Hardware hardware;
-    ApplyOverrides(hardware, options);
+    const Hardware hardware = HardwareFromFile(options, "--dry-run");
     const Footprints footprints = ChooseFootprints(hardware, options);
-    DescribeSetup(hardware, options, footprints, BuildPlan(options, footprints));
+    DescribeSetup(hardware, options, footprints, ProbeGroups(options, hardware, footprints));
     return 0;
 }
 
@@ -153,34 +94,9 @@ int main(int argc, char** argv)
             return RunTune(options);
         }
 
-        if (options.dryRun && options.thermalCurve)
-        {
-            std::cout << "Thermal curve (--thermal-curve): sleep 120 s; spin 120 s, sleep 180 s; DRAM loads 120 s, sleep "
-                << "180 s; 6 x (DRAM loads 20 s, sleep 10 s); plus 3 x --idle-s (no warm-up: the first sleep settles). About 15 min.\n";
-            return 0;
-        }
-
-        if (options.dryRun && options.thermalLoad)
-        {
-            const uint64_t phases = (5 * options.duties.size() + 1) * 2;
-            std::cout << "Thermal load (--thermal-load): " << phases << " phases of 60 s preparation + " << options.thermalHoldS
-                << " s hold; about " << (phases * (60 + options.thermalHoldS) + 120) / 60 << " min.\n";
-            return 0;
-        }
-
         if (options.dryRun)
         {
             return DryRun(options);
-        }
-
-        if (options.thermalCurve)
-        {
-            return RunThermalCurve(options);
-        }
-
-        if (options.thermalLoad)
-        {
-            return RunThermalLoad(options);
         }
 
         return options.validate.empty() ? RunProbes(options) : RunValidation(options);

@@ -18,7 +18,7 @@ std::map<std::string, std::string>& Canonical()
 
 } // namespace
 
-std::vector<std::string> ModelCounters(const std::string& tableFile, const bool study)
+std::vector<std::string> ModelCounters(const std::string& tableFile)
 {
     std::ifstream input(tableFile);
 
@@ -34,14 +34,6 @@ std::vector<std::string> ModelCounters(const std::string& tableFile, const bool 
     for (const auto& entry : root.at("counters"))
     {
         const std::string name = entry.at("name").get<std::string>();
-
-        // Screening counters (NEXT_STEPS_PLAN M3, M4): only with --study-counters, so that other runs collect what they
-        // did before (SASS counters are collected by patching the kernel and add profiling passes).
-        if (entry.contains("study") && entry.at("study").get<bool>() && !study)
-        {
-            continue;
-        }
-
         names.push_back(name);
 
         if (entry.contains("alias_of"))

@@ -5,8 +5,7 @@ A model is calibrated on one GPU at one SM clock. Before a tuner trusts it on an
 driver update, or at another clock, run a short probe run at full rate there and compare it with what the model's own
 calibration run measured for the same probes:
 
-    ./EnergyProbesCuda $GPU --mt4g FILE --compute --duty 100 --warmup-s 30 --idle-s 0 \
-        --min-time-ms 5000 --max-time-ms 10000 --output Quick                         # about 5 min
+    ./EnergyProbesCuda $GPU --mt4g FILE --quick --output Quick                        # about 4 min
     python3 tools/check_model.py --model rtx3090_1200mhz.model.json --run Quick
 
 It compares, per probe: the time per access (the clock and the memory behave as in the calibration), and the energy per
@@ -22,7 +21,7 @@ calibration's, which shows a driver or GPU that counts differently. The verdict:
             ranking holds, its absolute energies need the factor; --write FILE writes a model with the factor and this
             GPU's baseline applied.
   FAIL      times differ (another clock or memory configuration), the energies differ probe by probe, or the counts
-            differ. Calibrate this GPU (docs/CALIBRATION.md: Porting to another GPU).
+            differ. Calibrate this GPU (README.md).
 
 Only probes that the run measured at a clock matching its own baseline count; with rows withheld for that reason the
 GPU's clock is not constant (not locked, or throttled), and a check at full rate cannot tell how the model does there.
@@ -94,7 +93,7 @@ def compare(model, rows, use_withheld=False):
 
 def compare_counts(model, rows):
     """(label, relative change of the probe's model energy, the event that moves it most) per probe that the profiled run
-    and the model file both have. Model files from before 2026-11-13 have no counts: None."""
+    and the model file both have. Model files without counts: None."""
     reference = {p["label"]: p["counts"] for p in model.data["probes"] if p.get("counts")}
     if not reference:
         return None

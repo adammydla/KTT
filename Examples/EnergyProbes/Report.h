@@ -1,4 +1,4 @@
-// The printed report of a probe run: every row, the CUPTI counters and the summary.
+// The analysis of a probe run's rows, printed and written to the files the tools read.
 #pragma once
 
 #include <vector>
@@ -8,14 +8,8 @@
 #include "Options.h"
 #include "Rows.h"
 
-void PrintRows(const std::vector<Row>& rows);
-
-void PrintCounters(const std::vector<Row>& rows);
-
-void PrintSummary(const std::vector<Row>& rows, const std::vector<ProbeFit>& fits, const Footprints& footprints,
-    const BaselineModel& baseline, const Options& options, const NvmlMonitor* monitor);
-
-// The analysis of a probe run's rows: energies above the baseline (`rows` gets them), the fits across duties, the row and
-// counter tables, the summary and the studies; writes PREFIX.csv, PREFIX_fits.csv and PREFIX_energy_table.json.
-void ReportProbeRun(std::vector<Row>& rows, const BaselineModel& baseline, const Footprints& footprints,
-    const Hardware& hardware, const Options& options, const NvmlMonitor* monitor);
+// Energies above the baseline (`rows` gets them) and the fits across duties; prints the rows, the baseline and the fits,
+// and writes PREFIX.csv (every row) and PREFIX_energy_table.json (device, baseline, idle power, fits, provenance), from
+// which tools/build_model.py builds the model. tools/check_run.py checks the run.
+void ReportProbeRun(std::vector<Row>& rows, const BaselineModel& baseline, const Hardware& hardware, const Options& options,
+    const NvmlMonitor* monitor);

@@ -178,17 +178,6 @@ void GpuSession::WarmUp(const ktt::KernelId kernel)
     }
 }
 
-void GpuSession::RunFor(const ktt::KernelId kernel, const uint64_t seconds, const std::string& label, const std::string& probe,
-    const std::string& operation, const std::string& level)
-{
-    const ktt::PreciseMeasurementParameters fixed(seconds * 1000, seconds * 1000, 1.0, ktt::DurationCalculationMethod::Average);
-
-    for (const auto& result : RunProbe(m_Tuner, kernel, label, m_Options.outputPrefix, fixed))
-    {
-        m_Rows.push_back(MakeRow(result, probe, operation, level, m_Stats, m_Hardware, m_Footprints));
-    }
-}
-
 void GpuSession::Run(const ktt::KernelId kernel, const std::string& label, const std::string& probe,
     const std::string& operation, const std::string& level)
 {
@@ -256,13 +245,13 @@ std::vector<Row>& GpuSession::GetRows()
     return m_Rows;
 }
 
-SleepBaselines::SleepBaselines(GpuSession& session, const ktt::KernelDefinitionId sleep, const Configure& configure,
-    const ktt::ArgumentId counts, const size_t count) :
+SleepBaselines::SleepBaselines(GpuSession& session, const ktt::KernelDefinitionId sleep, const ktt::ArgumentId counts,
+    const size_t count) :
     m_Session(session)
 {
     for (size_t i = 0; i < count; ++i)
     {
-        m_Kernels.push_back(session.CreateKernel("Sleep" + std::to_string(i), sleep, configure, false, counts));
+        m_Kernels.push_back(session.CreateKernel("sleep" + std::to_string(i), sleep, Configure{}, false, counts));
     }
 }
 

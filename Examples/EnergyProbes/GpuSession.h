@@ -37,11 +37,6 @@ public:
     // Runs `kernel` for --warmup-s seconds without keeping its results.
     void WarmUp(const ktt::KernelId kernel);
 
-    // Runs a kernel for exactly `seconds` (KTT's precise measurement with a tolerance that accepts any power), traced,
-    // and records its rows: the phases of --thermal-curve.
-    void RunFor(const ktt::KernelId kernel, const uint64_t seconds, const std::string& label, const std::string& probe,
-        const std::string& operation, const std::string& level);
-
     // Measures every configuration of `kernel` and adds a row for each; `probe`, `operation` and `level` name the rows
     // whose kernel parameters do not (see MakeRow).
     void Run(const ktt::KernelId kernel, const std::string& label, const std::string& probe, const std::string& operation,
@@ -75,8 +70,8 @@ private:
 class SleepBaselines
 {
 public:
-    SleepBaselines(GpuSession& session, const ktt::KernelDefinitionId sleep, const Configure& configure,
-        const ktt::ArgumentId counts, const size_t count);
+    SleepBaselines(GpuSession& session, const ktt::KernelDefinitionId sleep, const ktt::ArgumentId counts,
+        const size_t count);
 
     void RunNext();
 

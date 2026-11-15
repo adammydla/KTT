@@ -150,9 +150,7 @@ private:
     std::map<std::string, std::vector<std::string>> m_Aliases; // canonical name -> other names
     std::vector<std::string> m_LsuShared;
     std::vector<std::string> m_LsuGlobal;
-    bool m_Busy = true;
     double m_BusyScaleGbs = 95.0;
-    bool m_FmaHalves = false;
     double m_BaselineW = 0.0;
     double m_BaselineTemperatureC = 0.0;
     double m_BaselineSlope = 0.0;

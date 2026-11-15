@@ -1,10 +1,8 @@
 """The CUPTI counter table of EnergyProbes (tools/counters.json), for the Python tools.
 
-The table is the one place for counter names: ModelCounters() in ProbeKernels.cpp collects every name in it, and
-energy_model.py, check_counters.py and check_run.py take the names, the events they feed, their aliases (the same counter
-under another chip's name) and their alternatives (a different counter that some GPUs have instead) from here. A counter
-that is not in the table cannot be read (value_of raises), so a new counter has to be added to the table first, and then
-the program collects it and the checks know it.
+The table is the one place for counter names: the program collects every name in it (CounterTable.cpp), and the tools
+take the names, the events they feed and their aliases (the same counter under another chip's name) from here. A counter
+that is not in the table cannot be read (value_of raises), so a new counter has to be added to the table first.
 """
 
 import csv
@@ -30,10 +28,6 @@ ALIASES = {}
 for _alias, _name in CANONICAL.items():
     ALIASES[_name] = ALIASES.get(_name, ()) + (_alias,)
 
-# Counters of which a GPU has one or the other (fp16 inside the fma pipe or on a pipe of its own).
-ALTERNATIVES = {name: entry["alternative"] for name, entry in ENTRIES.items() if "alternative" in entry}
-
-
 def number(text):
     try:
         return float(text)
@@ -43,10 +37,8 @@ def number(text):
 
 def read_rows(path):
     """The rows of a run's CSV (PREFIX.csv, PREFIX_validation.csv) as dicts, like csv.DictReader. Runs from before
-    2026-11-11 wrote notes with a comma unquoted ("placement: 25 of 68 SMs without 4 blocks, 11 with blocks sharing a
-    stripe"): such a row has one cell more than the header, and every counter after the note is read one column off (on
-    an RTX 2080 Ti two write probes came out with 'tensor' instructions and without DRAM sectors that way). The extra
-    cells are put back into the note."""
+    2026-11-11 wrote notes with a comma unquoted: such a row has more cells than the header, and every counter after the
+    note would be read one column off. The extra cells are put back into the note."""
     with open(path, newline="") as file:
         reader = csv.reader(file)
         header = next(reader, None)
@@ -78,31 +70,12 @@ def value_of(row, name):
     return math.nan
 
 
-def describe(name):
-    """What a counter is for: the events it feeds, or its use, or the counter it is an alias of."""
-    entry = ENTRIES[name]
-    if "alias_of" in entry:
-        return f"{entry['alias_of']} under another name ({entry.get('exists', 'other chips')})"
-    return entry.get("feeds") or entry.get("use") or "no event"
-
-
-def in_group(name, group):
-    return ENTRIES[name].get("group") == group
-
-
 def feeding(event):
     """The counters that feed exactly `event`, in table order."""
     return [name for name in NAMES if ENTRIES[name].get("feeds") == event]
 
 
-def applicable(name, compute_capability):
-    """False if the counter cannot exist on a GPU of this compute capability (min_cc above it); True if it may, or if the
-    compute capability is unknown (None)."""
-    minimum = ENTRIES[name].get("min_cc")
-    return compute_capability is None or minimum is None or compute_capability >= minimum
-
-
-# Compute capability from a GPU's name, for runs that did not record it (before 2026-11-06): the first pattern found.
+# Compute capability from a GPU's name, for runs that did not record it: the first pattern found.
 DEVICE_CC = [(r"RTX 20\d\d|TITAN RTX|Quadro RTX|\bT4\b|GTX 16\d\d", 7.5), (r"V100|TITAN V\b", 7.0),
              (r"A100|A30\b|A800", 8.0), (r"RTX 30\d\d|RTX A\d+|\bA10G?\b|\bA40\b|A16\b|A2\b", 8.6),
              (r"RTX 40\d\d|RTX \d+ Ada|L4\b|L40", 8.9), (r"H100|H200|H800|GH200", 9.0), (r"B100|B200|GB200", 10.0),

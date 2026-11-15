@@ -10,8 +10,7 @@
 // level and operation, shared-memory wavefronts, constant-cache requests and misses) and the counters that check which
 // level served the probes. KTT skips the ones a GPU lacks with a warning; tools/check_counters.py says what that costs.
 // Probes and validation kernels collect the same set.
-// study: also the screening counters (entries with "study": true; --study-counters).
-std::vector<std::string> ModelCounters(const std::string& tableFile, bool study = false);
+std::vector<std::string> ModelCounters(const std::string& tableFile);
 
 // The canonical name of a counter: for an alias (the same counter under another chip's name, alias_of in the table) the
 // name the tools read, otherwise the name itself. Uses the table that ModelCounters() loaded.

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -19,7 +20,7 @@
 #include "EnergyModel.h"
 #include "EnergyTuner.h"
 #include "NvmlMonitor.h"
-#include "ProbeKernels.h"
+#include "Options.h"
 #include "Tune.h"
 #include "ValidationKernels.h"
 
@@ -33,22 +34,8 @@ using Measure = std::function<void(TuneRow&)>;
 
 EnergyObjective ObjectiveOf(const std::string& name)
 {
-    if (name == "energy")
-    {
-        return EnergyObjective::Energy;
-    }
-
-    if (name == "edp")
-    {
-        return EnergyObjective::Edp;
-    }
-
-    if (name == "ed2p")
-    {
-        return EnergyObjective::Ed2p;
-    }
-
-    return EnergyObjective::Time;
+    return name == "energy" ? EnergyObjective::Energy : name == "edp" ? EnergyObjective::Edp
+        : name == "ed2p" ? EnergyObjective::Ed2p : EnergyObjective::Time;
 }
 
 std::string Text(const double value, const int digits)
@@ -58,27 +45,241 @@ std::string Text(const double value, const int digits)
     return stream.str();
 }
 
-// Predicts every row, prints the model's choice per kernel and writes the CSV. With `measure`, the candidates (the choice,
-// its contenders and the fastest configuration, or all with --tune-measure all) are then measured and the measured best
-// is the final choice.
+// The predicted rows of one kernel, with their predictions in the same order.
+struct KernelRows
+{
+    std::string kernel;
+    std::vector<TuneRow*> rows;
+    std::vector<EnergyPrediction> predictions;
+};
+
+bool Contains(const std::vector<size_t>& indices, const size_t index)
+{
+    return std::find(indices.cbegin(), indices.cend(), index) != indices.cend();
+}
+
+// The model's choice, its contenders, how it compares with the fastest configuration, and the predictions' warnings.
+void PrintChoice(const KernelRows& k, const EnergyRecommendation& choice, const size_t fastest, const Options& options)
+{
+    const auto& predictions = k.predictions;
+    const EnergyPrediction& best = predictions[choice.index];
+    std::cout << "  use: " << best.label << "\n       " << Text(best.energyJ, 4) << " J +- " << Text(best.sdJ, 2)
+        << " per launch (" << Text(best.dynamicJ, 4) << " dynamic), " << Text(best.kernelS * 1e3, 4) << " ms\n";
+
+    if (choice.contenders.empty())
+    {
+        std::cout << "  confident: every other admissible configuration is predicted worse by more than "
+            << Text(options.contenderSd, 3) << " sd\n";
+    }
+    else
+    {
+        std::cout << "  " << choice.contenders.size() << " contender(s) within " << Text(options.contenderSd, 3)
+            << " sd (measure them if the difference matters):\n";
+
+        for (const size_t i : choice.contenders)
+        {
+            std::cout << "    +" << Fixed(100.0 * (choice.values[i] / choice.values[choice.index] - 1.0), 1) << " %  "
+                << predictions[i].label << "  (" << Text(predictions[i].energyJ, 4) << " J, "
+                << Text(predictions[i].kernelS * 1e3, 4) << " ms)\n";
+        }
+    }
+
+    if (fastest != choice.index)
+    {
+        std::cout << "  against the fastest configuration: " << Fixed(100.0 * (best.energyJ / predictions[fastest].energyJ - 1.0), 1)
+            << " % energy, +" << Fixed(100.0 * (best.kernelS / predictions[fastest].kernelS - 1.0), 1) << " % time\n";
+    }
+
+    const auto offClock = static_cast<size_t>(std::count_if(predictions.cbegin(), predictions.cend(), [](const auto& p)
+    {
+        return std::any_of(p.warnings.cbegin(), p.warnings.cend(), [](const std::string& w) { return w.rfind("SM clock", 0) == 0; });
+    }));
+
+    // Measured on an unlocked RTX 3090 (README, "Limits").
+    if (2 * offClock > predictions.size())
+    {
+        std::cout << "  NOTICE: " << offClock << " of " << predictions.size() << " configurations ran at another SM "
+            << "clock than the model's. On a GPU that is not\n  clock-locked and runs at its power limit, energy is "
+            << "close to the limit times the time: rank by time there\n  (--objective time).\n";
+    }
+
+    std::vector<std::string> warnings;
+
+    for (const auto& p : predictions)
+    {
+        for (const auto& warning : p.warnings)
+        {
+            if ((offClock < 4 || warning.rfind("SM clock", 0) != 0)
+                && std::find(warnings.cbegin(), warnings.cend(), warning) == warnings.cend())
+            {
+                warnings.push_back(warning);
+                std::cout << "  WARNING: " << warning << "\n";
+            }
+        }
+    }
+}
+
+// --tune-measure: NVML's power of the candidates (the choice, its contenders and the fastest configuration, or all),
+// and the final choice among them. Measurements closer than --measure-margin are not told apart (NVML's
+// repeatability): among those near the measured best, the model's choice if it is one of them, else the fastest.
+void MeasureCandidates(const EnergyModel& model, KernelRows& k, const EnergyRecommendation& choice, const size_t fastest,
+    const Options& options, const Measure& measure)
+{
+    const EnergyObjective objective = ObjectiveOf(options.objective);
+    std::vector<size_t> candidates{choice.index};
+    candidates.insert(candidates.end(), choice.contenders.cbegin(), choice.contenders.cend());
+
+    for (size_t i = 0; i < k.rows.size(); ++i)
+    {
+        if ((i == fastest || options.tuneMeasure == "all") && !Contains(candidates, i))
+        {
+            candidates.push_back(i);
+        }
+    }
+
+    const auto measured = [&](const size_t i)
+    {
+        EnergyPrediction p;
+        p.energyJ = k.rows[i]->measuredJ;
+        p.kernelS = k.rows[i]->measuredS;
+        return ObjectiveValue(p, objective);
+    };
+    const auto role = [&](const size_t i)
+    {
+        return i == choice.index ? "the model's choice" : Contains(choice.contenders, i) ? "a contender"
+            : i == fastest ? "the fastest configuration" : "another configuration";
+    };
+    std::cout << "  measured with NVML (" << options.validateMs << " ms each; energy = baseline x kernel time + "
+        << "the power above it x wall time; predicted at the measurement's temperature):\n    " << std::setw(10)
+        << "E [J]" << std::setw(8) << "P [W]" << std::setw(10) << "t [ms]" << std::setw(11) << "predicted" << "  "
+        << "configuration\n";
+    std::vector<size_t> tied;
+    size_t lowest = k.rows.size();
+
+    for (const size_t i : candidates)
+    {
+        TuneRow& row = *k.rows[i];
+        measure(row);
+
+        if (std::isnan(row.measuredJ))
+        {
+            continue;
+        }
+
+        // The baseline at the temperature of this measurement, not of the timing pass.
+        const double atMeasurement = model.Predict(row.counters, row.kernelS, row.measuredTemperatureC, row.smClockMHz,
+            false, row.kernel).energyJ;
+        std::cout << "    " << std::setw(10) << Text(row.measuredJ, 4) << std::setw(8) << Fixed(row.measuredPowerW, 1)
+            << std::setw(10) << Text(row.measuredS * 1e3, 4) << std::setw(9)
+            << Fixed(100.0 * (atMeasurement / row.measuredJ - 1.0), 1) << " %  " << row.configuration << "  (" << role(i)
+            << ")\n";
+        tied.push_back(i);
+        lowest = lowest == k.rows.size() || measured(i) < measured(lowest) ? i : lowest;
+    }
+
+    if (tied.empty())
+    {
+        return;
+    }
+
+    const double limit = measured(lowest) * (1.0 + options.measureMarginPct / 100.0);
+    tied.erase(std::remove_if(tied.begin(), tied.end(), [&](const size_t i) { return measured(i) > limit; }), tied.end());
+    const size_t final = Contains(tied, choice.index) ? choice.index : *std::min_element(tied.cbegin(), tied.cend(),
+        [&](const size_t a, const size_t b) { return k.rows[a]->measuredS < k.rows[b]->measuredS; });
+    k.rows[final]->measuredChoice = "final";
+    AppendNote(k.rows[final]->measuredRole, "final");
+    std::cout << "  " << tied.size() << " measured within " << Fixed(options.measureMarginPct, 1)
+        << " % of the lowest (--measure-margin, the repeatability of a measurement)\n  final choice: " << role(final);
+
+    if (final != choice.index && !std::isnan(k.rows[choice.index]->measuredJ))
+    {
+        std::cout << ", " << Fixed(100.0 * (measured(choice.index) / measured(final) - 1.0), 1)
+            << " % better than the model's choice (measured " << options.objective << ")";
+    }
+
+    if (final != fastest && !std::isnan(k.rows[fastest]->measuredJ))
+    {
+        std::cout << ", " << Fixed(100.0 * (measured(fastest) / measured(final) - 1.0), 1) << " % better than the fastest";
+    }
+
+    std::cout << "\n  " << k.rows[final]->configuration << "\n";
+}
+
+// The kernel's scale (measured / predicted dynamic energy): it removes the kernel's bias from the predictions of its
+// other configurations and from comparisons with other kernels. It comes from `count` configurations at evenly spaced
+// quantiles of the predicted dynamic energy, not from the candidates of the choice: those were picked for a low
+// prediction and gave a scale 5.8 % (rms) off the scale over all configurations, the quantiles 2.0 %.
+void ScaleKernel(EnergyModel& model, KernelRows& k, const uint64_t count, const Measure& measure)
+{
+    std::vector<size_t> order(k.rows.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(), [&](const size_t a, const size_t b)
+        { return k.predictions[a].unscaledDynamicJ < k.predictions[b].unscaledDynamicJ; });
+    std::vector<size_t> picked;
+
+    for (uint64_t q = 0; q < std::min<uint64_t>(count, order.size()); ++q)
+    {
+        const size_t i = order[count == 1 ? order.size() / 2 : static_cast<size_t>(std::llround(static_cast<double>(q)
+            * static_cast<double>(order.size() - 1) / static_cast<double>(count - 1)))];
+
+        if (!Contains(picked, i))
+        {
+            picked.push_back(i);
+        }
+    }
+
+    std::vector<EnergyPrediction> predictions;
+    std::vector<double> measuredDynamic;
+
+    for (const size_t i : picked)
+    {
+        TuneRow& row = *k.rows[i];
+
+        if (std::isnan(row.measuredJ))
+        {
+            measure(row);
+        }
+
+        AppendNote(row.measuredRole, "scale");
+
+        if (!std::isnan(row.measuredJ))
+        {
+            predictions.push_back(k.predictions[i]);
+            measuredDynamic.push_back(row.measuredJ - model.BaselineW(row.measuredTemperatureC) * row.measuredS);
+        }
+    }
+
+    if (std::isnan(model.KernelScale(k.kernel, predictions, measuredDynamic)))
+    {
+        std::cout << "  no kernel scale: " << measuredDynamic.size() << " of the " << picked.size()
+            << " configurations for it were measured (3 needed)\n";
+        return;
+    }
+
+    for (TuneRow* row : k.rows)
+    {
+        row->scaledPredictedJ = model.Predict(row->counters, row->kernelS, row->temperatureC, row->smClockMHz, false,
+            row->kernel).energyJ;
+    }
+
+    std::cout << "  the kernel's scale from " << measuredDynamic.size() << " configurations spread over its predicted "
+        << "dynamic energy: x " << Fixed(model.KernelScale(k.kernel, predictions, measuredDynamic), 3)
+        << " (column scaled_predicted_j)\n";
+}
+
+// Predicts every row, prints the model's choice per kernel and writes the CSV. With `measure`, the candidates are then
+// measured and the measured best is the final choice.
 int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Options& options, const std::string& file,
     const Measure& measure = {})
 {
     EnergyModel model = fileModel;
     model.SetAccounting(AccountingOf(options.accounting), options.idleW.value_or(NaN));
-    const EnergyObjective objective = ObjectiveOf(options.objective);
     const double maxSlowdown = options.maxSlowdownPct.has_value() ? options.maxSlowdownPct.value() / 100.0 : NaN;
     const double maxEnergyIncrease = options.maxEnergyIncreasePct.has_value() ? options.maxEnergyIncreasePct.value() / 100.0
         : NaN;
     std::cout << "\nModel: " << model.DeviceName() << " at " << Fixed(model.ClockMHz(), 0) << " MHz, relative sd of the "
-        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %, accounting " << options.accounting;
-
-    if (model.Accounting() == EnergyAccounting::AboveIdle)
-    {
-        std::cout << " (idle " << Fixed(model.IdlePowerW(), 1) << " W)";
-    }
-
-    std::cout << "\n";
+        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %, accounting " << options.accounting
+        << (model.Accounting() == EnergyAccounting::AboveIdle ? " (idle " + Fixed(model.IdlePowerW(), 1) + " W)" : "") << "\n";
     std::vector<std::string> kernels;
 
     for (auto& row : rows)
@@ -114,339 +315,85 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
 
     for (const auto& kernel : kernels)
     {
-        std::vector<EnergyPrediction> predictions;
-        std::vector<TuneRow*> predicted;
-        size_t all = 0;
+        KernelRows k{kernel, {}, {}};
+        std::vector<TuneRow*> all;
 
         for (auto& row : rows)
         {
             if (row.kernel == kernel)
             {
-                ++all;
+                all.push_back(&row);
 
                 if (row.predicted)
                 {
-                    predictions.push_back(row.prediction);
-                    predicted.push_back(&row);
+                    k.rows.push_back(&row);
+                    k.predictions.push_back(row.prediction);
                 }
             }
         }
 
-        std::cout << "\n" << kernel << ": " << predictions.size() << " of " << all << " configurations predicted, objective "
+        std::cout << "\n" << kernel << ": " << k.rows.size() << " of " << all.size() << " configurations predicted, objective "
             << options.objective << "\n";
-        std::map<const TuneRow*, std::string> marks;
+        EnergyRecommendation choice;
+        std::string problem;
+        bool recommended = true;
 
-        if (predictions.empty())
+        try
         {
-            failed = true;
-
-            for (const auto& row : rows)
+            if (k.rows.empty())
             {
-                if (row.kernel == kernel && !row.note.empty())
-                {
-                    std::cout << "  " << row.note << "\n";
-                    break;
-                }
+                const auto noted = std::find_if(all.cbegin(), all.cend(), [](const TuneRow* row) { return !row->note.empty(); });
+                throw std::runtime_error(noted != all.cend() ? (*noted)->note : "no configuration has a time and counters");
             }
+
+            choice = model.Recommend(k.predictions, ObjectiveOf(options.objective), options.contenderSd, maxSlowdown,
+                maxEnergyIncrease);
         }
-        else
+        catch (const std::exception& error)
         {
-            EnergyRecommendation choice;
+            // Nothing predicted, or no admissible configuration under both limits: nothing to recommend for this kernel.
+            std::cout << "  " << error.what() << "\n";
+            problem = k.rows.empty() ? "" : "no admissible configuration";
+            recommended = false;
+            failed = true;
+        }
 
-            try
-            {
-                choice = model.Recommend(predictions, objective, options.contenderSd, maxSlowdown, maxEnergyIncrease);
-            }
-            catch (const std::exception& error)
-            {
-                // No admissible configuration under both limits: nothing to recommend for this kernel.
-                std::cout << "  " << error.what() << "\n";
-                failed = true;
-
-                for (const auto& row : rows)
-                {
-                    if (row.kernel == kernel)
-                    {
-                        output << CsvText(row.kernel) << "," << CsvText(row.configuration) << ",,,,,,,," << options.accounting
-                            << ",,,,,,,,,,,no admissible configuration\n";
-                    }
-                }
-
-                continue;
-            }
-
-            const EnergyPrediction& best = predictions[choice.index];
-            marks[predicted[choice.index]] = "best";
-            std::cout << "  use: " << best.label << "\n       " << Text(best.energyJ, 4) << " J +- " << Text(best.sdJ, 2)
-                << " per launch (" << Text(best.dynamicJ, 4) << " dynamic), " << Text(best.kernelS * 1e3, 4) << " ms\n";
-
-            if (choice.contenders.empty())
-            {
-                std::cout << "  confident: every other admissible configuration is predicted worse by more than "
-                    << Text(options.contenderSd, 3) << " sd\n";
-            }
-            else
-            {
-                std::cout << "  " << choice.contenders.size() << " contender(s) within " << Text(options.contenderSd, 3)
-                    << " sd (measure them if the difference matters):\n";
-
-                for (const size_t i : choice.contenders)
-                {
-                    marks[predicted[i]] = "contender";
-                    std::cout << "    +" << Fixed(100.0 * (choice.values[i] / choice.values[choice.index] - 1.0), 1) << " %  "
-                        << predictions[i].label << "  (" << Text(predictions[i].energyJ, 4) << " J, "
-                        << Text(predictions[i].kernelS * 1e3, 4) << " ms)\n";
-                }
-            }
-
-            const auto fastest = std::min_element(predictions.cbegin(), predictions.cend(),
-                [](const EnergyPrediction& a, const EnergyPrediction& b) { return a.kernelS < b.kernelS; });
-
-            if (static_cast<size_t>(fastest - predictions.cbegin()) != choice.index)
-            {
-                std::cout << "  against the fastest configuration: " << Fixed(100.0 * (best.energyJ / fastest->energyJ - 1.0), 1)
-                    << " % energy, +" << Fixed(100.0 * (best.kernelS / fastest->kernelS - 1.0), 1) << " % time\n";
-            }
-
-            std::vector<std::string> warnings;
-            size_t offClock = 0;
-
-            for (const auto& p : predictions)
-            {
-                offClock += std::any_of(p.warnings.cbegin(), p.warnings.cend(),
-                    [](const std::string& w) { return w.rfind("SM clock", 0) == 0; });
-            }
-
-            // Measured on an unlocked RTX 3090 (README, "The model at another operating point").
-            if (2 * offClock > predictions.size())
-            {
-                std::cout << "  NOTICE: " << offClock << " of " << predictions.size() << " configurations ran at another SM "
-                    << "clock than the model's. On a GPU that is not\n  clock-locked and runs at its power limit, energy is "
-                    << "close to the limit times the time: rank by time there\n  (--objective time).\n";
-            }
-
-            for (const auto& p : predictions)
-            {
-                for (const auto& warning : p.warnings)
-                {
-                    if (offClock >= 4 && warning.rfind("SM clock", 0) == 0)
-                    {
-                        continue;
-                    }
-
-                    if (std::find(warnings.cbegin(), warnings.cend(), warning) == warnings.cend())
-                    {
-                        warnings.push_back(warning);
-                        std::cout << "  WARNING: " << warning << "\n";
-                    }
-                }
-            }
+        if (recommended)
+        {
+            const auto fastest = static_cast<size_t>(std::min_element(k.predictions.cbegin(), k.predictions.cend(),
+                [](const EnergyPrediction& a, const EnergyPrediction& b) { return a.kernelS < b.kernelS; })
+                - k.predictions.cbegin());
+            PrintChoice(k, choice, fastest, options);
 
             if (measure)
             {
-                const size_t fastestIndex = static_cast<size_t>(fastest - predictions.cbegin());
-                std::vector<size_t> candidates{choice.index};
-                candidates.insert(candidates.end(), choice.contenders.cbegin(), choice.contenders.cend());
-
-                if (std::find(candidates.cbegin(), candidates.cend(), fastestIndex) == candidates.cend())
-                {
-                    candidates.push_back(fastestIndex);
-                }
-
-                if (options.tuneMeasure == "all")
-                {
-                    for (size_t i = 0; i < predictions.size(); ++i)
-                    {
-                        if (std::find(candidates.cbegin(), candidates.cend(), i) == candidates.cend())
-                        {
-                            candidates.push_back(i);
-                        }
-                    }
-                }
-
-                const auto measured = [&](const size_t i)
-                {
-                    EnergyPrediction p;
-                    p.energyJ = predicted[i]->measuredJ;
-                    p.kernelS = predicted[i]->measuredS;
-                    return ObjectiveValue(p, objective);
-                };
-                std::cout << "  measured with NVML (" << options.validateMs << " ms each; energy = baseline x kernel time + "
-                    << "the power above it x wall time; "
-                    << "predicted at the measurement's temperature):\n"
-                    << "    " << std::setw(10) << "E [J]" << std::setw(8) << "P [W]" << std::setw(10) << "t [ms]"
-                    << std::setw(11) << "predicted" << "  " << std::left << std::setw(10) << "role" << std::right
-                    << "configuration\n";
-
-                std::vector<size_t> measuredOnes;
-
-                for (const size_t i : candidates)
-                {
-                    TuneRow& row = *predicted[i];
-                    measure(row);
-
-                    if (std::isnan(row.measuredJ))
-                    {
-                        continue;
-                    }
-
-                    measuredOnes.push_back(i);
-                    // The baseline at the temperature of this measurement, not of the timing pass.
-                    const double atMeasurement = model.Predict(row.counters, row.kernelS, row.measuredTemperatureC,
-                        row.smClockMHz, false, row.kernel).energyJ;
-                    const std::string role = i == choice.index ? "choice" : std::find(choice.contenders.cbegin(),
-                        choice.contenders.cend(), i) != choice.contenders.cend() ? "contender" : i == fastestIndex ? "fastest" : "";
-                    std::cout << "    " << std::setw(10) << Text(row.measuredJ, 4) << std::setw(8) << Fixed(row.measuredPowerW, 1)
-                        << std::setw(10) << Text(row.measuredS * 1e3, 4) << std::setw(9)
-                        << Fixed(100.0 * (atMeasurement / row.measuredJ - 1.0), 1) << " %  " << std::left
-                        << std::setw(10) << role << std::right << row.configuration << "\n";
-                }
-
-                // Measurements closer than the margin are not told apart (NVML's repeatability): among those near the
-                // measured best, the model's choice if it is one of them, else the fastest of them.
-                size_t final = predictions.size();
-                const double margin = options.measureMarginPct / 100.0;
-
-                if (!measuredOnes.empty())
-                {
-                    const size_t lowest = *std::min_element(measuredOnes.cbegin(), measuredOnes.cend(),
-                        [&](const size_t a, const size_t b) { return measured(a) < measured(b); });
-                    std::vector<size_t> tied;
-
-                    for (const size_t i : measuredOnes)
-                    {
-                        if (measured(i) <= measured(lowest) * (1.0 + margin))
-                        {
-                            tied.push_back(i);
-                        }
-                    }
-
-                    final = std::find(tied.cbegin(), tied.cend(), choice.index) != tied.cend() ? choice.index
-                        : *std::min_element(tied.cbegin(), tied.cend(), [&](const size_t a, const size_t b)
-                            { return predicted[a]->measuredS < predicted[b]->measuredS; });
-                    std::cout << "  " << tied.size() << " measured within " << Fixed(100.0 * margin, 1)
-                        << " % of the lowest (--measure-margin, the repeatability of a measurement)\n";
-                }
-
-                // The kernel's scale (measured / predicted dynamic energy, the awake baseline at each measurement's
-                // temperature taken off): it removes the kernel's bias from the predictions of its other configurations
-                // and from comparisons with other kernels. It comes from --tune-scale-configs configurations at evenly
-                // spaced quantiles of the predicted dynamic energy, not from the candidates above: those were chosen for
-                // a low prediction and gave a scale 5.8 % (rms) off the scale over all configurations, the quantiles
-                // 2.0 % (27 kernel runs, NEXT_STEPS_PLAN P1; random picks 2.5 %).
+                MeasureCandidates(model, k, choice, fastest, options, measure);
                 const uint64_t scaleConfigs = options.tuneScaleConfigs.value_or(options.tune.size() > 1 ? 5 : 0);
 
                 if (scaleConfigs > 0)
                 {
-                    std::vector<size_t> order(predictions.size());
-
-                    for (size_t i = 0; i < order.size(); ++i)
-                    {
-                        order[i] = i;
-                    }
-
-                    std::sort(order.begin(), order.end(), [&](const size_t a, const size_t b)
-                        { return predictions[a].unscaledDynamicJ < predictions[b].unscaledDynamicJ; });
-                    std::vector<size_t> scaleSet;
-
-                    for (uint64_t q = 0; q < std::min<uint64_t>(scaleConfigs, order.size()); ++q)
-                    {
-                        const size_t position = scaleConfigs == 1 ? order.size() / 2
-                            : static_cast<size_t>(std::llround(static_cast<double>(q) * static_cast<double>(order.size() - 1)
-                                / static_cast<double>(scaleConfigs - 1)));
-                        const size_t i = order[position];
-
-                        if (std::find(scaleSet.cbegin(), scaleSet.cend(), i) == scaleSet.cend())
-                        {
-                            scaleSet.push_back(i);
-                        }
-                    }
-
-                    std::vector<EnergyPrediction> scalePredictions;
-                    std::vector<double> measuredDynamic;
-
-                    for (const size_t i : scaleSet)
-                    {
-                        TuneRow& row = *predicted[i];
-
-                        if (std::isnan(row.measuredJ))
-                        {
-                            measure(row);
-                        }
-
-                        AppendNote(row.measuredRole, "scale");
-
-                        if (!std::isnan(row.measuredJ))
-                        {
-                            scalePredictions.push_back(predictions[i]);
-                            measuredDynamic.push_back(row.measuredJ - model.BaselineW(row.measuredTemperatureC) * row.measuredS);
-                        }
-                    }
-
-                    const double scale = model.KernelScale(kernel, scalePredictions, measuredDynamic);
-
-                    if (!std::isnan(scale))
-                    {
-                        for (TuneRow* row : predicted)
-                        {
-                            row->scaledPredictedJ = model.Predict(row->counters, row->kernelS, row->temperatureC,
-                                row->smClockMHz, false, row->kernel).energyJ;
-                        }
-
-                        std::cout << "  the kernel's scale from " << measuredDynamic.size() << " configurations spread over its "
-                            << "predicted dynamic energy: x " << Fixed(scale, 3) << " (column scaled_predicted_j)\n";
-                    }
-                    else
-                    {
-                        std::cout << "  no kernel scale: " << measuredDynamic.size() << " of the " << scaleSet.size()
-                            << " configurations for it were measured (3 needed)\n";
-                    }
-                }
-
-                if (final != predictions.size())
-                {
-                    predicted[final]->measuredChoice = "final";
-                    AppendNote(predicted[final]->measuredRole, "final");
-                    std::cout << "  final choice: " << (final == choice.index ? "the model's choice"
-                        : std::find(choice.contenders.cbegin(), choice.contenders.cend(), final) != choice.contenders.cend()
-                        ? "a contender" : final == fastestIndex ? "the fastest configuration" : "another configuration");
-
-                    if (final != choice.index && !std::isnan(predicted[choice.index]->measuredJ))
-                    {
-                        std::cout << ", " << Fixed(100.0 * (measured(choice.index) / measured(final) - 1.0), 1)
-                            << " % better than the model's choice (measured " << options.objective << ")";
-                    }
-
-                    if (final != fastestIndex && !std::isnan(predicted[fastestIndex]->measuredJ))
-                    {
-                        std::cout << ", " << Fixed(100.0 * (measured(fastestIndex) / measured(final) - 1.0), 1)
-                            << " % better than the fastest";
-                    }
-
-                    std::cout << "\n  " << predicted[final]->configuration << "\n";
+                    ScaleKernel(model, k, scaleConfigs, measure);
                 }
             }
         }
 
-        for (const auto& row : rows)
+        for (const TuneRow* row : all)
         {
-            if (row.kernel != kernel)
-            {
-                continue;
-            }
-
-            const auto mark = marks.find(&row);
-            output << CsvText(row.kernel) << "," << CsvText(row.configuration) << "," << CsvValue(row.kernelS, 12) << ","
-                << CsvValue(row.temperatureC) << "," << CsvValue(row.smClockMHz) << ","
-                << CsvValue(row.predicted ? row.prediction.energyJ : NaN, 12) << ","
-                << CsvValue(row.predicted ? row.prediction.sdJ : NaN, 12) << ","
-                << CsvValue(row.predicted ? row.prediction.dynamicJ : NaN, 12) << ","
-                << CsvValue(row.predicted ? row.prediction.baselineJ : NaN, 12) << "," << options.accounting << ","
-                << (mark != marks.cend() ? mark->second : "") << "," << CsvValue(row.measuredPowerW) << ","
-                << CsvValue(row.measuredS, 12) << "," << CsvValue(row.measuredJ, 12) << "," << CsvValue(row.measuredTemperatureC)
-                << "," << row.measuredChoice << "," << CsvValue(row.scaledPredictedJ, 12) << ","
-                << CsvValue(row.measuredWallS, 12) << "," << CsvValue(row.busy, 4) << "," << CsvText(row.measuredRole) << ","
-                << CsvText(row.note) << "\n";
+            const auto index = static_cast<size_t>(std::find(k.rows.cbegin(), k.rows.cend(), row) - k.rows.cbegin());
+            const std::string mark = !recommended || index >= k.rows.size() ? "" : index == choice.index ? "best" : Contains(choice.contenders, index)
+                ? "contender" : "";
+            const bool predicted = row->predicted && problem.empty();
+            output << CsvText(row->kernel) << "," << CsvText(row->configuration) << "," << CsvValue(row->kernelS, 12) << ","
+                << CsvValue(row->temperatureC) << "," << CsvValue(row->smClockMHz) << ","
+                << CsvValue(predicted ? row->prediction.energyJ : NaN, 12) << ","
+                << CsvValue(predicted ? row->prediction.sdJ : NaN, 12) << ","
+                << CsvValue(predicted ? row->prediction.dynamicJ : NaN, 12) << ","
+                << CsvValue(predicted ? row->prediction.baselineJ : NaN, 12) << "," << options.accounting << "," << mark
+                << "," << CsvValue(row->measuredPowerW) << "," << CsvValue(row->measuredS, 12) << ","
+                << CsvValue(row->measuredJ, 12) << "," << CsvValue(row->measuredTemperatureC) << "," << row->measuredChoice
+                << "," << CsvValue(row->scaledPredictedJ, 12) << "," << CsvValue(row->measuredWallS, 12) << ","
+                << CsvValue(row->busy, 4) << "," << CsvText(row->measuredRole) << ","
+                << CsvText(problem.empty() ? row->note : problem) << "\n";
         }
     }
 
@@ -517,7 +464,7 @@ int RunPredict(const Options& options)
     };
     const size_t temperature = optional("temperature_c");
     const size_t clock = optional("sm_clock_mhz");
-    const size_t repeat = optional("repeat");
+    const size_t repeat = optional("repeat"); // runs of earlier versions measured a configuration several times
     std::vector<TuneRow> rows;
 
     while (std::getline(input, line))
@@ -536,7 +483,7 @@ int RunPredict(const Options& options)
             cells.erase(cells.begin() + static_cast<std::ptrdiff_t>(note) + 1);
         }
 
-        // --validate-repeat: the first power measurement of each configuration.
+        // Only the first power measurement of each configuration.
         if (cells.size() < header.size() || cells[valid] != "1"
             || (repeat < header.size() && !cells[repeat].empty() && cells[repeat] != "0"))
         {
@@ -659,21 +606,12 @@ int RunTune(const Options& options)
     meter.baselineW = [model](const double temperatureC) { return model.BaselineW(temperatureC); };
     EnergyTuner energyTuner(tuner, meter);
 
-    SetValidationInputs({options.validateData, options.validateSizeScale, options.accelwattchDirectory});
-
     for (const auto& name : options.tune)
     {
         const ValidationKernel kernel = AddValidationKernel(tuner, name, kernelPrefix + "../Examples/");
         energyTuner.AddKernel(name, kernel.kernel, kernel.definition, kernel.compilerOptions);
 
-        if (options.validateSeed.has_value())
-        {
-            tuner.SetSearcher(kernel.kernel, std::make_unique<SeededSearcher>(options.validateSeed.value()));
-        }
-        else
-        {
-            tuner.SetSearcher(kernel.kernel, std::make_unique<ktt::RandomSearcher>());
-        }
+        tuner.SetSearcher(kernel.kernel, std::make_unique<ktt::RandomSearcher>());
 
         energyTuner.TimeConfigurations(name, options.validateConfigs);
     }
