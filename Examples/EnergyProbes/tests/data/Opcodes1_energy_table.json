@@ -1,0 +1,42 @@
+{
+ "baseline": {"mean_temperature_c":64.41666666666666,"mean_w":113.983,"runs":2,"slope_w_per_c":0.0},
+ "board": {"clock_policy_ms_during_run":{"board-limit":0.0,"hw-power-brake":null,"hw-thermal":null,"reliability":0.0,"sw-power-cap":81295.519488,"sw-thermal":null},"ecc_enabled":null,"memory_power_w":null,"memory_temperature_c":null,"nvlink_low_power":null,"power_smoothing_enabled":null},
+ "compute_capability": "8.6",
+ "cuda_context": {"generic_compression_supported":true,"l2_fetch_granularity_bytes":64,"l2_persisting_set_aside_bytes":1179648},
+ "device": "NVIDIA GeForce RTX 3090",
+ "fit_min_duty_pct": 25,
+ "fits": [
+  {"duties":"100/25","fixed_w":-0.5417806251847015,"footprint_bytes":0,"level":"compute","operation":"opcode-dadd","pj_per_access":31.18535435946615,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":0.5855686310415136,"footprint_bytes":0,"level":"compute","operation":"opcode-dadd-const","pj_per_access":11.38615094239418,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-0.8622706490260832,"footprint_bytes":0,"level":"compute","operation":"opcode-dfma-rr","pj_per_access":69.84565448985211,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-0.6905035603239154,"footprint_bytes":0,"level":"compute","operation":"opcode-dfma-rr-const","pj_per_access":35.645589472977456,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-0.15733659607688555,"footprint_bytes":0,"level":"compute","operation":"opcode-dmul","pj_per_access":33.70531859552553,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":0.5899958635026499,"footprint_bytes":0,"level":"compute","operation":"opcode-dmul-const","pj_per_access":13.882353233620709,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.4030345698014592,"footprint_bytes":0,"level":"compute","operation":"opcode-f2i","pj_per_access":30.37749647902489,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.6089540535798292,"footprint_bytes":0,"level":"compute","operation":"opcode-fadd","pj_per_access":8.198759445265136,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.397974631307825,"footprint_bytes":0,"level":"compute","operation":"opcode-fadd-const","pj_per_access":5.95065576222738,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.9778505031942544,"footprint_bytes":0,"level":"compute","operation":"opcode-ffma-rr","pj_per_access":11.820650891825823,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.635109542749845,"footprint_bytes":0,"level":"compute","operation":"opcode-ffma-rr-const","pj_per_access":5.625513745485533,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.8614275398731337,"footprint_bytes":0,"level":"compute","operation":"opcode-fmul","pj_per_access":9.107382316305221,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.8656406719514251,"footprint_bytes":0,"level":"compute","operation":"opcode-fmul-const","pj_per_access":6.926642307730993,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-3.5604655645909276,"footprint_bytes":0,"level":"compute","operation":"opcode-i2f","pj_per_access":23.590383992861018,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.5329458502341922,"footprint_bytes":0,"level":"compute","operation":"opcode-iadd3","pj_per_access":6.919098252158937,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.4804510853158277,"footprint_bytes":0,"level":"compute","operation":"opcode-iadd3-const","pj_per_access":5.1560428644816465,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.133418365616876,"footprint_bytes":0,"level":"compute","operation":"opcode-lop3","pj_per_access":6.756216866125464,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.622231474700346,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-ex2","pj_per_access":28.58050338231932,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.4764970244794213,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-lg2","pj_per_access":28.77002455099399,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.3713197137631425,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-rcp","pj_per_access":28.160776822317636,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-0.95998010819293,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-sin","pj_per_access":33.78511154055611,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.375841065386055,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-sqrt","pj_per_access":28.96548122622977,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.4968938999584047,"footprint_bytes":0,"level":"compute","operation":"opcode-mufu-tanh","pj_per_access":28.521377373094182,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-0.9571092586118013,"footprint_bytes":0,"level":"compute","operation":"opcode-popc","pj_per_access":22.477474993066817,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.4438502423178647,"footprint_bytes":0,"level":"compute","operation":"opcode-shf","pj_per_access":10.216883089614255,"r2":null,"width_bytes":0}
+ ],
+ "idle": [
+  {"label":"idle-noctx","memory_clock_mhz":810.0,"power_w":39.88856020942401,"sm_clock_mhz":1200.0,"temperature_c":54.068062827225134},
+  {"label":"idle-start","memory_clock_mhz":7180.366492146597,"power_w":92.40669633507854,"sm_clock_mhz":1200.0,"temperature_c":56.031413612565444},
+  {"label":"idle-end","memory_clock_mhz":7498.884816753926,"power_w":103.53720418848182,"sm_clock_mhz":1200.0,"temperature_c":63.638743455497384}
+ ],
+ "provenance": {"cuda_driver_version":"13.0","driver_version":"580.126.09","power_limit_w":350.0,"serial":null,"uuid":"GPU-7df088a1-fff4-ab84-ab61-fecb110faa53"},
+ "sm_clock_mhz": 1200.0
+}

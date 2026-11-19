@@ -18,7 +18,7 @@ std::map<std::string, std::string>& Canonical()
 
 } // namespace
 
-std::vector<std::string> ModelCounters(const std::string& tableFile)
+std::vector<std::string> ModelCounters(const std::string& tableFile, const double computeCapability)
 {
     std::ifstream input(tableFile);
 
@@ -34,6 +34,12 @@ std::vector<std::string> ModelCounters(const std::string& tableFile)
     for (const auto& entry : root.at("counters"))
     {
         const std::string name = entry.at("name").get<std::string>();
+
+        if (computeCapability > 0.0 && entry.contains("min_cc") && entry.at("min_cc").get<double>() > computeCapability + 1e-9)
+        {
+            continue;
+        }
+
         names.push_back(name);
 
         if (entry.contains("alias_of"))

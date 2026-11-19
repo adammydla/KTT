@@ -27,7 +27,116 @@ const std::vector<ClockReason> ClockReasons =
     {0x100ULL, "display", false}
 };
 
+// NVML's cumulative clock-limited time per reason, in ns (field values; GPUs and drivers that lack one report an error).
+const std::vector<std::pair<unsigned int, const char*>>& LimitReasons()
+{
+    static const std::vector<std::pair<unsigned int, const char*>> reasons = {
+        {NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_POWER_CAP, "sw-power-cap"},
+        {NVML_FI_DEV_CLOCKS_EVENT_REASON_SW_THERM_SLOWDOWN, "sw-thermal"},
+        {NVML_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN, "hw-thermal"},
+        {NVML_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN, "hw-power-brake"},
+        {NVML_FI_DEV_PERF_POLICY_BOARD_LIMIT, "board-limit"},
+        {NVML_FI_DEV_PERF_POLICY_RELIABILITY, "reliability"}};
+    return reasons;
+}
+
+double FieldNumber(const nvmlFieldValue_t& field)
+{
+    if (field.nvmlReturn != NVML_SUCCESS)
+    {
+        return NaN;
+    }
+
+    switch (field.valueType)
+    {
+    case NVML_VALUE_TYPE_DOUBLE: return field.value.dVal;
+    case NVML_VALUE_TYPE_UNSIGNED_INT: return static_cast<double>(field.value.uiVal);
+    case NVML_VALUE_TYPE_UNSIGNED_LONG: return static_cast<double>(field.value.ulVal);
+    case NVML_VALUE_TYPE_UNSIGNED_LONG_LONG: return static_cast<double>(field.value.ullVal);
+    case NVML_VALUE_TYPE_SIGNED_LONG_LONG: return static_cast<double>(field.value.sllVal);
+    case NVML_VALUE_TYPE_SIGNED_INT: return static_cast<double>(field.value.siVal);
+    default: return NaN;
+    }
+}
+
+// Field values by (field id, scope id); NaN for each one the GPU or driver does not report.
+std::vector<double> ReadFields(nvmlDevice_t device, const std::vector<std::pair<unsigned int, unsigned int>>& ids)
+{
+    std::vector<nvmlFieldValue_t> fields(ids.size());
+
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        fields[i].fieldId = ids[i].first;
+        fields[i].scopeId = ids[i].second;
+    }
+
+    std::vector<double> values(ids.size(), NaN);
+
+    if (!fields.empty() && nvmlDeviceGetFieldValues(device, static_cast<int>(fields.size()), fields.data()) == NVML_SUCCESS)
+    {
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            values[i] = FieldNumber(fields[i]);
+        }
+    }
+
+    return values;
+}
+
+std::vector<double> LimitedNs(nvmlDevice_t device)
+{
+    std::vector<std::pair<unsigned int, unsigned int>> ids;
+
+    for (const auto& reason : LimitReasons())
+    {
+        ids.emplace_back(reason.first, 0u);
+    }
+
+    return ReadFields(device, ids);
+}
+
 } // namespace
+
+nlohmann::json DescribeBoard(nvmlDevice_t device)
+{
+    const auto number = [](const double value) { return std::isnan(value) ? nlohmann::json() : nlohmann::json(value); };
+    const auto flag = [](const double value) { return std::isnan(value) ? nlohmann::json() : nlohmann::json(value != 0.0); };
+    nlohmann::json board;
+    nvmlEnableState_t current{};
+    nvmlEnableState_t pending{};
+    board["ecc_enabled"] = nvmlDeviceGetEccMode(device, &current, &pending) == NVML_SUCCESS
+        ? nlohmann::json(current == NVML_FEATURE_ENABLED) : nlohmann::json();
+    // Power smoothing (Blackwell) holds power up when work stops: with it on, the sleep baseline and low duties are wrong.
+    // The memory power scope, where a board reports it, is a direct reading of DRAM power; NVLink links in their
+    // low-power state shift the idle and sleep baselines.
+    const std::vector<double> values = ReadFields(device, {{NVML_FI_PWR_SMOOTHING_ENABLED, 0u},
+        {NVML_FI_DEV_MEMORY_TEMP, 0u}, {NVML_FI_DEV_POWER_INSTANT, NVML_POWER_SCOPE_MEMORY},
+        {NVML_FI_DEV_NVLINK_GET_POWER_STATE, 0u}});
+    board["power_smoothing_enabled"] = flag(values[0]);
+    board["memory_temperature_c"] = number(values[1]);
+    board["memory_power_w"] = std::isnan(values[2]) ? nlohmann::json() : nlohmann::json(values[2] / 1000.0);
+    board["nvlink_low_power"] = flag(values[3]);
+    return board;
+}
+
+nlohmann::json DescribeCudaContext()
+{
+    nlohmann::json context;
+    CUdevice device = 0;
+    int compression = 0;
+    size_t fetch = 0;
+    size_t persisting = 0;
+    const bool haveDevice = cuCtxGetDevice(&device) == CUDA_SUCCESS;
+    context["generic_compression_supported"] = haveDevice
+        && cuDeviceGetAttribute(&compression, CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED, device) == CUDA_SUCCESS
+        ? nlohmann::json(compression != 0) : nlohmann::json();
+    context["l2_fetch_granularity_bytes"] = haveDevice && cuCtxGetLimit(&fetch, CU_LIMIT_MAX_L2_FETCH_GRANULARITY) == CUDA_SUCCESS
+        ? nlohmann::json(fetch) : nlohmann::json();
+    context["l2_persisting_set_aside_bytes"] = haveDevice
+        && cuCtxGetLimit(&persisting, CU_LIMIT_PERSISTING_L2_CACHE_SIZE) == CUDA_SUCCESS
+        ? nlohmann::json(persisting) : nlohmann::json();
+    return context;
+}
 
 std::string DescribeReasons(const unsigned long long reasons, const bool limitersOnly)
 {
@@ -114,6 +223,65 @@ NvmlMonitor::NvmlMonitor(const ktt::DeviceIndex cudaOrdinal)
 
     unsigned long long energy = 0;
     m_HasEnergyCounter = nvmlDeviceGetTotalEnergyConsumption(m_Device, &energy) == NVML_SUCCESS;
+    m_LimitedNsAtCreation = LimitedNs(m_Device);
+}
+
+std::vector<double> NvmlMonitor::SupportedMemoryClocks() const
+{
+    unsigned int count = 0;
+    std::vector<unsigned int> clocks;
+
+    if (nvmlDeviceGetSupportedMemoryClocks(m_Device, &count, nullptr) == NVML_ERROR_INSUFFICIENT_SIZE && count > 0)
+    {
+        clocks.resize(count);
+
+        if (nvmlDeviceGetSupportedMemoryClocks(m_Device, &count, clocks.data()) != NVML_SUCCESS)
+        {
+            clocks.clear();
+        }
+
+        clocks.resize(std::min<size_t>(clocks.size(), count));
+    }
+
+    return std::vector<double>(clocks.cbegin(), clocks.cend());
+}
+
+std::vector<double> NvmlMonitor::SupportedSmClocks(const double memoryMHz) const
+{
+    unsigned int count = 0;
+    std::vector<unsigned int> clocks;
+    const auto memory = static_cast<unsigned int>(std::lround(memoryMHz));
+
+    if (!std::isnan(memoryMHz)
+        && nvmlDeviceGetSupportedGraphicsClocks(m_Device, memory, &count, nullptr) == NVML_ERROR_INSUFFICIENT_SIZE && count > 0)
+    {
+        clocks.resize(count);
+
+        if (nvmlDeviceGetSupportedGraphicsClocks(m_Device, memory, &count, clocks.data()) != NVML_SUCCESS)
+        {
+            clocks.clear();
+        }
+
+        clocks.resize(std::min<size_t>(clocks.size(), count));
+    }
+
+    return std::vector<double>(clocks.cbegin(), clocks.cend());
+}
+
+nlohmann::json NvmlMonitor::GetBoard() const
+{
+    nlohmann::json board = DescribeBoard(m_Device);
+    const std::vector<double> now = LimitedNs(m_Device);
+    nlohmann::json limited = nlohmann::json::object();
+
+    for (size_t i = 0; i < now.size(); ++i)
+    {
+        const double ms = (now[i] - m_LimitedNsAtCreation[i]) / 1e6;
+        limited[LimitReasons()[i].second] = std::isnan(ms) ? nlohmann::json() : nlohmann::json(ms);
+    }
+
+    board["clock_policy_ms_during_run"] = limited; // NVML's cumulative counters; see TraceSummary::limitedMs
+    return board;
 }
 
 DeviceProvenance NvmlMonitor::GetProvenance() const
@@ -187,6 +355,7 @@ void NvmlMonitor::Start(const std::string& label, const uint64_t intervalMs)
     StopSampling();
     m_Label = label;
     m_Samples.clear();
+    m_LimitedNsAtStart = LimitedNs(m_Device);
     m_Stop = false;
 
     m_Thread = std::thread([this, intervalMs]()
@@ -211,7 +380,27 @@ TraceSummary NvmlMonitor::Stop(const double tailSeconds)
         m_AllSamples.emplace_back(m_Label, sample);
     }
 
-    return Summarize(m_Samples, tailSeconds);
+    TraceSummary summary = Summarize(m_Samples, tailSeconds);
+    const std::vector<double> now = LimitedNs(m_Device);
+
+    for (size_t i = 0; i < now.size() && i < m_LimitedNsAtStart.size(); ++i)
+    {
+        const double ms = (now[i] - m_LimitedNsAtStart[i]) / 1e6;
+
+        if (std::isnan(ms))
+        {
+            continue;
+        }
+
+        summary.limitedMs = (std::isnan(summary.limitedMs) ? 0.0 : summary.limitedMs) + ms;
+
+        if (ms > 0.0)
+        {
+            summary.limitedBy += (summary.limitedBy.empty() ? "" : "+") + std::string(LimitReasons()[i].second);
+        }
+    }
+
+    return summary;
 }
 
 void NvmlMonitor::WriteTraces(const std::string& file) const
@@ -296,17 +485,11 @@ TraceSample NvmlMonitor::TakeSample(const double timeS) const
         sample.fanPct = value;
     }
 
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
-    if (nvmlDeviceGetCurrentClocksThrottleReasons(m_Device, &large) == NVML_SUCCESS)
+    // The newer name of nvmlDeviceGetCurrentClocksThrottleReasons (NVML 12.x, driver R535 and newer), same bits.
+    if (nvmlDeviceGetCurrentClocksEventReasons(m_Device, &large) == NVML_SUCCESS)
     {
         sample.reasons = large;
     }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
 
     return sample;
 }

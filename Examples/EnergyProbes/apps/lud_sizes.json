@@ -1,0 +1,9 @@
+{
+ "about": "lud (lud -s N, its own smooth matrix) at four sizes, to tell an error that grows with the work from a fixed one (docs/APPLICATIONS.md, 2026-11-18). The work grows as N^3.",
+ "apps": [
+  {"name": "lud_4096", "command": ["lud", "-s", "4096"], "windows": 12, "window": 6},
+  {"name": "lud_8192", "command": ["lud", "-s", "8192"], "windows": 12, "window": 6},
+  {"name": "lud_12288", "command": ["lud", "-s", "12288"], "windows": 12, "window": 6},
+  {"name": "lud_16384", "command": ["lud", "-s", "16384"], "windows": 12, "window": 6}
+ ]
+}

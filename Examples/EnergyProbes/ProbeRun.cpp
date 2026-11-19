@@ -57,7 +57,7 @@ int RunProbes(const Options& options)
         try
         {
             tuner.SetProfiling(true);
-            tuner.SetProfilingCounters(ModelCounters(options.counterTable));
+            tuner.SetProfilingCounters(ModelCounters(options.counterTable, session.GetHardware().ComputeCapability()));
         }
         catch (const ktt::KttException& error)
         {

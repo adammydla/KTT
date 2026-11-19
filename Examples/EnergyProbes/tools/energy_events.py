@@ -41,6 +41,16 @@ def events(row):
     fp16 = counter(row, "smsp__inst_executed_pipe_fp16.sum" if separate_fp16 else "smsp__inst_executed_pipe_fma_type_fp16.sum")
     fp64 = counter(row, "smsp__inst_executed_pipe_fp64.sum")
     tensor = counter(row, "smsp__inst_executed_pipe_tensor.sum")
+    # Instructions the tensor pipe counts that are not matrix products of the tensor probe: HFMA2.MMA (fp16 FMAs that
+    # ptxas places on the tensor pipe, GA100 and GH100) is fp16 work; DMMA (FP64 matrix products) is counted on the
+    # fp64 pipe on GA102, AD102 and GB202, but on the tensor pipe on GA100 and GH100 and its sub-pipe on GB100, and is
+    # priced with the fp64 pipe everywhere (NEWER_ARCHITECTURES.md items 8, 9). Chips without these counters count 0.
+    tensor_hfma2 = counter(row, "smsp__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum")
+    tensor_dmma = counter(row, "smsp__inst_executed_pipe_tensor_op_dmma.sum") \
+        + counter(row, "smsp__inst_executed_pipe_tensor_subpipe_dmma.sum")
+    # IMMA (8-bit integer matrix products) costs 36 % more per warp instruction than HMMA on an RTX 3090 (3.32 against
+    # 2.44 nJ), so it has an event of its own. Runs without the counter count it in "inst tensor", as before 2026-11-16.
+    tensor_imma = counter(row, "smsp__inst_executed_pipe_tensor_op_imma.sum")
     xu = counter(row, "smsp__inst_executed_pipe_xu.sum")
     lsu = counter(row, "smsp__inst_executed_pipe_lsu.sum")
     tex = counter(row, "smsp__inst_executed_pipe_tex.sum")
@@ -65,14 +75,22 @@ def events(row):
     # The lsu pipe's instructions by memory space. With one lsu event the fit traded the energy of a shared instruction
     # for that of its wavefronts and priced the global instructions too low. Runs without these counters count all lsu
     # instructions as "inst lsu other".
+    # Inactive lanes (2026-11-17): a warp instruction costs about a third of a full one whatever its active lanes (the
+    # lanes probes: one FFMA lane 100 pJ, a full warp 282 pJ). Lanes a branch left inactive are 32 x the warp
+    # instructions minus the thread instructions (which count predicated-off lanes as active, so the guarded moves of
+    # the indexing probe, which cost almost nothing, are not inactive lanes). In warp instructions of 32 lanes; runs
+    # without the thread counter count 0.
+    thread_inst = value_of(row, "smsp__thread_inst_executed.sum")
+    inactive = max(total - thread_inst / 32, 0.0) if not math.isnan(thread_inst) else 0.0
     shared_inst = sum(counter(row, name) for name in SHARED_INSTRUCTIONS)
     global_inst = sum(counter(row, name) for name in GLOBAL_INSTRUCTIONS)
     return {
         "inst alu": alu_lanes,
         "inst fma (fp32, imad)": fma_lanes if separate_fp16 else max(fma_lanes - fp16_lanes, 0.0),
-        "inst fp16": fp16_lanes,
-        "inst fp64": fp64,
-        "inst tensor": tensor,
+        "inst fp16": fp16_lanes + tensor_hfma2,
+        "inst fp64": fp64 + tensor_dmma,
+        "inst tensor": max(tensor - tensor_hfma2 - tensor_dmma - tensor_imma, 0.0),
+        "inst tensor imma": tensor_imma,
         "inst xu (mufu)": xu,
         "inst lsu shared": shared_inst,
         "inst lsu global": global_inst,
@@ -80,6 +98,7 @@ def events(row):
         "inst tex": tex,  # no probe prices it (KTT has no texture arguments): a kernel that counts it gets a warning
         # Branches and the instructions of the control, address and uniform units.
         "inst other": max(total - alu - fma - fp64 - tensor - xu - lsu - tex - (fp16 if separate_fp16 else 0.0), 0.0),
+        "inst inactive lanes": inactive,
         "L1 sector": counter(row, "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
         + counter(row, "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum")
         + counter(row, "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum")

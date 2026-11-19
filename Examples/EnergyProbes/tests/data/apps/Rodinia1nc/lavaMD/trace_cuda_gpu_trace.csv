@@ -1,0 +1,7 @@
+Start (ns),Duration (ns),CorrId,GrdX,GrdY,GrdZ,BlkX,BlkY,BlkZ,Reg/Trd,StcSMem (MB),DymSMem (MB),Bytes (MB),Throughput (MB/s),SrcMemKd,DstMemKd,Device,Ctx,GreenCtx,Strm,Name
+1319248419,3628649,239,,,,,,,,,,41.984,11545.600,Pageable,Device,NVIDIA GeForce RTX 3090 (1),1,,7,[CUDA memcpy Host-to-Device]
+1322952141,16827357,240,,,,,,,,,,204.800,12083.200,Pageable,Device,NVIDIA GeForce RTX 3090 (1),1,,7,[CUDA memcpy Host-to-Device]
+1339854699,4166190,241,,,,,,,,,,51.200,12288.000,Pageable,Device,NVIDIA GeForce RTX 3090 (1),1,,7,[CUDA memcpy Host-to-Device]
+1344096698,16691707,242,,,,,,,,,,204.800,12083.200,Pageable,Device,NVIDIA GeForce RTX 3090 (1),1,,7,[CUDA memcpy Host-to-Device]
+1360972248,4081768491,243,64000,1,1,128,1,1,48,0.007,0.000,,,,,NVIDIA GeForce RTX 3090 (1),1,,7,"kernel_gpu_cuda(par_str, dim_str, box_str *, FOUR_VECTOR *, double *, FOUR_VECTOR *)"
+5442771203,19586141,246,,,,,,,,,,204.800,10444.800,Device,Pageable,NVIDIA GeForce RTX 3090 (1),1,,7,[CUDA memcpy Device-to-Host]

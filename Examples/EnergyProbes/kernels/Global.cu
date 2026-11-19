@@ -11,6 +11,30 @@
 //   WIDTH       bytes per access and thread, 4, 8 or 16
 //   FOOTPRINT   bytes of the global working set (power of two)
 //   GRID_STRIPES   power of two >= number of blocks; stripes of a footprint split over the whole grid
+//   MIX_FFMA, MIX_L1, MIX_SHARED   (the optional groups "mix" and "saturate", 2026-11-18; LOAD_OP 0 only, default 0 = none,
+//               and then the code is the plain probe's) work added to every access: MIX_FFMA FFMAs with three registers
+//               (the recurrence of the compute probe's COMPUTE_OP 9, four copies, so a multiple of 4), MIX_L1 more loads of
+//               WIDTH bytes from two rows of the block's own stripe (L1 hits after the first pass), MIX_SHARED conflict-free
+//               16-byte shared loads from two rows of the block's shared array. They test whether the energies of mixed
+//               work add up as the model adds them: FFMA next to loads, and memory-instruction work while DRAM or L2 is
+//               the bottleneck (Bicg on the random sweep looked as if that work were free).
+
+#ifndef MIX_FFMA
+#define MIX_FFMA 0
+#endif
+#ifndef MIX_L1
+#define MIX_L1 0
+#endif
+#ifndef MIX_SHARED
+#define MIX_SHARED 0
+#endif
+#define MIX_ANY (MIX_FFMA > 0 || MIX_L1 > 0 || MIX_SHARED > 0)
+#if MIX_ANY && LOAD_OP != 0
+#error "MIX_FFMA, MIX_L1 and MIX_SHARED go with LOAD_OP 0"
+#endif
+#if MIX_FFMA % 4 != 0
+#error "MIX_FFMA must be a multiple of 4"
+#endif
 
 #if (LOAD_OP == 6 || LOAD_OP == 7) && WIDTH != 4
 #error "The atomics (LOAD_OP 6 and 7) are 32-bit: WIDTH must be 4"
@@ -35,6 +59,18 @@
 // split footprints. The counter is not reset between launches. Consecutive claims are distinct modulo BLOCKS_PER_SM, so the
 // slots of one launch are distinct as long as no SM gets more than BLOCKS_PER_SM blocks; the host checks this from the SM
 // ids and slots written to counts[2 * gridDim.x + blockIdx.x].
+#if MIX_ANY
+// As in Compute.cu: stores `value` to `slot` and loads it back (volatile), so ptxas cannot know the value: the FFMA copies
+// stay separate, and the extra loads' addresses (two rows, read over and over) cannot be proven equal and merged.
+__device__ __forceinline__ u32 MixThroughMemory(u32* slot, const u32 value)
+{
+    u32 result;
+    asm volatile("st.volatile.global.u32 [%1], %2;\n\tld.volatile.global.u32 %0, [%1];" : "=r"(result) : "l"(slot), "r"(value)
+        : "memory");
+    return result;
+}
+#endif
+
 extern "C" __global__ void probeGlobal(Element* __restrict__ data, u32* __restrict__ sink, u64* __restrict__ counts,
     u32* __restrict__ smCounters, const u32 gridSplit, const u32 activeSms, const u32 idleRatio, const u64 durationNs)
 {
@@ -82,6 +118,42 @@ extern "C" __global__ void probeGlobal(Element* __restrict__ data, u32* __restri
 #if RETURNS_WORDS
     u32 accumulator = 0;
 #endif
+#if MIX_ANY
+    u32* const mixSlot = &sink[blockIdx.x * BLOCK_SIZE + threadIdx.x];
+#endif
+#if MIX_L1 > 0 || MIX_SHARED > 0
+    const u32 mixStep = MixThroughMemory(mixSlot, BLOCK_SIZE);
+    const u32 mixMask = MixThroughMemory(mixSlot, 2u * BLOCK_SIZE - 1u);
+#endif
+#if MIX_FFMA > 0
+    // Four copies of one chain x -> x * x + c, updated as a = a*b + c0, b = c*d + c1, c = a*c + c2, d = b*d + c3 (three
+    // different registers per FFMA), c = -1.9 from a start in [1, 2): the compute probe's COMPUTE_OP 9.
+    const u32 mixInitial = 0x3f800000u | (mix((blockIdx.x * BLOCK_SIZE + threadIdx.x) * 16u) >> 10);
+    float copies[4];
+    float constants[4];
+
+    for (int i = 0; i < 4; ++i)
+    {
+        copies[i] = __uint_as_float(MixThroughMemory(mixSlot, mixInitial));
+        constants[i] = __uint_as_float(MixThroughMemory(mixSlot, 0xbff33333u));
+    }
+#endif
+#if MIX_L1 > 0
+    // Two rows of the block's stripe, read over and over: L1 hits once loaded.
+    u32 l1Index = threadIdx.x;
+#endif
+#if MIX_SHARED > 0
+    __shared__ uint4 mixShared[2 * BLOCK_SIZE];
+
+    for (u32 i = threadIdx.x; i < 2 * BLOCK_SIZE; i += BLOCK_SIZE)
+    {
+        mixShared[i] = make_uint4(mix(4 * i), mix(4 * i + 1), mix(4 * i + 2), mix(4 * i + 3));
+    }
+
+    __syncthreads();
+    const u32 sharedBase = static_cast<u32>(__cvta_generic_to_shared(mixShared));
+    u32 sharedIndex = threadIdx.x;
+#endif
     u64 iterations = 0;
     const u64 start = globalTimer();
     u64 now = start;
@@ -120,6 +192,42 @@ extern "C" __global__ void probeGlobal(Element* __restrict__ data, u32* __restri
 #endif
             accumulator ^= WORDS;
 #endif
+#if MIX_L1 > 0
+            #pragma unroll
+            for (int e = 0; e < MIX_L1; ++e)
+            {
+                Element* const address = stripeData + l1Index;
+                WORD_VARIABLES;
+                LOAD("ld.global");
+                accumulator ^= WORDS;
+                l1Index = (l1Index + mixStep) & mixMask;
+            }
+#endif
+#if MIX_SHARED > 0
+            #pragma unroll
+            for (int e = 0; e < MIX_SHARED; ++e)
+            {
+                u32 sx, sy, sz, sw;
+                asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(sx), "=r"(sy), "=r"(sz), "=r"(sw)
+                    : "r"(sharedBase + 16u * sharedIndex));
+                accumulator ^= sx ^ sy ^ sz ^ sw;
+                sharedIndex = (sharedIndex + mixStep) & mixMask;
+            }
+#endif
+#if MIX_FFMA > 0
+            #pragma unroll
+            for (int f = 0; f < MIX_FFMA / 4; ++f)
+            {
+                const float a = copies[0];
+                const float b = copies[1];
+                const float c = copies[2];
+                const float d = copies[3];
+                copies[0] = fmaf(a, b, constants[0]);
+                copies[1] = fmaf(c, d, constants[1]);
+                copies[2] = fmaf(a, c, constants[2]);
+                copies[3] = fmaf(b, d, constants[3]);
+            }
+#endif
 #if WRITES_WORDS
             const u32 next = s0 ^ s1;
             s0 = s1;
@@ -141,6 +249,9 @@ extern "C" __global__ void probeGlobal(Element* __restrict__ data, u32* __restri
     sink[blockIdx.x * BLOCK_SIZE + threadIdx.x] = accumulator ^ s0 ^ s1 ^ s2 ^ s3;
 #elif WRITES_WORDS
     sink[blockIdx.x * BLOCK_SIZE + threadIdx.x] = s0 ^ s1 ^ s2 ^ s3;
+#elif MIX_FFMA > 0
+    sink[blockIdx.x * BLOCK_SIZE + threadIdx.x] = accumulator ^ __float_as_uint(copies[0]) ^ __float_as_uint(copies[1])
+        ^ __float_as_uint(copies[2]) ^ __float_as_uint(copies[3]);
 #else
     sink[blockIdx.x * BLOCK_SIZE + threadIdx.x] = accumulator;
 #endif

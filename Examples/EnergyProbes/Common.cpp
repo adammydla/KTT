@@ -6,6 +6,49 @@
 
 #include "Common.h"
 
+std::string ClockMismatch(const std::string& domain, const double expectedMHz, const double observedMHz,
+    const std::vector<double>& supportedMHz, const double fallbackStepMHz)
+{
+    if (std::isnan(expectedMHz) || std::isnan(observedMHz) || expectedMHz <= 0.0)
+    {
+        return "";
+    }
+
+    double step = fallbackStepMHz;
+    std::vector<double> clocks = supportedMHz;
+    std::sort(clocks.begin(), clocks.end());
+    clocks.erase(std::unique(clocks.begin(), clocks.end()), clocks.end());
+
+    if (clocks.size() >= 2)
+    {
+        const auto nearest = std::min_element(clocks.cbegin(), clocks.cend(),
+            [expectedMHz](const double a, const double b) { return std::abs(a - expectedMHz) < std::abs(b - expectedMHz); });
+        step = std::numeric_limits<double>::infinity();
+
+        if (nearest != clocks.cbegin())
+        {
+            step = std::min(step, *nearest - *(nearest - 1));
+        }
+
+        if (nearest + 1 != clocks.cend())
+        {
+            step = std::min(step, *(nearest + 1) - *nearest);
+        }
+    }
+
+    // Half a megahertz more for NVML's rounding of the reported clock.
+    if (std::abs(observedMHz - expectedMHz) <= step + 0.5)
+    {
+        return "";
+    }
+
+    std::ostringstream text;
+    text << "WARNING: the " << domain << " clock ran at " << Fixed(observedMHz, 0) << " MHz under load, not at the expected "
+         << Fixed(expectedMHz, 0) << " MHz (more than one clock step of " << Fixed(step, 0) << " MHz). The GPU may not "
+         << "apply this clock setting; the rows are labelled with the clock they ran at.";
+    return text.str();
+}
+
 std::string OperationName(const uint64_t loadOp)
 {
     switch (loadOp)
@@ -22,8 +65,16 @@ std::string OperationName(const uint64_t loadOp)
 std::string ComputeName(const uint64_t computeOp)
 {
     const std::vector<std::string> names = {"loop", "ffma", "dfma", "imad", "hfma2", "hmma", "mufu", "ffma-static",
-        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop"};
+        "ffma-indexed", "ffma3", "shfl", "bar", "ffma-loop", "imma", "dmma", "hmma-sparse", "qmma-fp8", "opcode"};
     return computeOp < names.size() ? names[computeOp] : "?";
+}
+
+std::string OpcodeName(const uint64_t opcode)
+{
+    const std::vector<std::string> names = {"?", "fadd", "fmul", "ffma-rr", "dadd", "dmul", "dfma-rr", "iadd3", "lop3", "shf",
+        "mufu-ex2", "mufu-lg2", "mufu-sin", "mufu-rcp", "mufu-sqrt", "mufu-tanh", "i2f", "f2i", "popc", "f2f", "ffma-same",
+        "ffma-reuse1", "ffma-reuse2"};
+    return opcode < names.size() ? names[opcode] : "?";
 }
 
 bool IsPowerOfTwo(const uint64_t value)

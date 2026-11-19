@@ -94,6 +94,11 @@ int main(int argc, char** argv)
             return RunTune(options);
         }
 
+        if (!options.recountCsv.empty())
+        {
+            return RunRecount(options);
+        }
+
         if (options.dryRun)
         {
             return DryRun(options);

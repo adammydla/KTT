@@ -117,6 +117,26 @@ void GpuSession::OpenMonitor()
             << m_Monitor->GetBusId() << "), power limit " << Fixed(m_Monitor->GetPowerLimitW(), 0) << " W, "
             << (m_Monitor->HasEnergyCounter() ? "energy counter available" : "no energy counter") << "\n";
 
+        // The board's settings (written to the energy table too). Power smoothing holds power up when work stops.
+        const nlohmann::json board = m_Monitor->GetBoard();
+        const nlohmann::json context = DescribeCudaContext();
+        const auto text = [](const nlohmann::json& value, const std::string& yes, const std::string& no)
+        {
+            return value.is_boolean() ? (value.get<bool>() ? yes : no) : std::string("not reported");
+        };
+        std::cout << "Board: ECC " << text(board["ecc_enabled"], "on", "off") << ", power smoothing "
+            << text(board["power_smoothing_enabled"], "on", "off") << ", memory power "
+            << (board["memory_power_w"].is_number() ? Fixed(board["memory_power_w"].get<double>(), 1) + " W" : "not reported")
+            << ", compressible memory " << text(context["generic_compression_supported"], "supported", "not supported")
+            << ", L2 fetch granularity " << (context["l2_fetch_granularity_bytes"].is_number()
+                ? std::to_string(context["l2_fetch_granularity_bytes"].get<size_t>()) + " B" : "not reported") << "\n";
+
+        if (board["power_smoothing_enabled"] == true)
+        {
+            std::cout << "WARNING: power smoothing is on: the GPU holds power up after work stops, so the sleep baseline "
+                << "and the low duties are wrong. Ask the administrator to turn it off for the calibration.\n";
+        }
+
         // KTT opens NVML device number <CUDA device number> for its power readings. NVML numbers GPUs in PCI order and
         // ignores CUDA_VISIBLE_DEVICES, so a different CUDA numbering makes KTT read the power of another GPU.
         if (m_Monitor->KttReadsSameGpu() == false)
@@ -175,6 +195,59 @@ void GpuSession::WarmUp(const ktt::KernelId kernel)
         const ktt::PreciseMeasurementParameters warmup(m_Options.warmupS * 1000, m_Options.warmupS * 1000, 1.0,
             ktt::DurationCalculationMethod::Average);
         RunProbe(m_Tuner, kernel, "warmup", m_Options.outputPrefix, warmup);
+        CheckClocks();
+    }
+}
+
+void GpuSession::CheckClocks() const
+{
+    // The warm-up's trace (its kernel is named "warmup"): the clocks NVML reported in its second half, under load.
+    if (m_Monitor == nullptr)
+    {
+        return;
+    }
+
+    const TraceSummary* trace = nullptr;
+
+    for (const auto& [key, launch] : m_Stats)
+    {
+        if (key.rfind("warmup|", 0) == 0 && launch.trace.has_value())
+        {
+            trace = &launch.trace.value();
+        }
+    }
+
+    if (trace == nullptr || std::isnan(trace->meanClockMHz))
+    {
+        return;
+    }
+
+    const double expectedSm = m_Options.lockClockMHz.has_value() ? static_cast<double>(m_Options.lockClockMHz.value())
+        : m_Options.expectedSmClockMHz;
+    std::cout << "Clock check (warm-up, under load): SM " << Fixed(trace->meanClockMHz, 0) << " MHz, memory "
+        << Fixed(trace->meanMemoryClockMHz, 0) << " MHz";
+
+    if (std::isnan(expectedSm) && std::isnan(m_Options.expectedMemoryClockMHz))
+    {
+        std::cout << " (no expected clock; --expect-clock SM[:MEM] compares them)\n";
+        return;
+    }
+
+    std::cout << "; expected SM " << (std::isnan(expectedSm) ? std::string("-") : Fixed(expectedSm, 0)) << ", memory "
+        << (std::isnan(m_Options.expectedMemoryClockMHz) ? std::string("-") : Fixed(m_Options.expectedMemoryClockMHz, 0))
+        << " MHz\n";
+    // Ampere and newer step the SM clock by 15 MHz; the memory clocks have no common step.
+    const std::string sm = ClockMismatch("SM", expectedSm, trace->meanClockMHz,
+        m_Monitor->SupportedSmClocks(trace->meanMemoryClockMHz), 15.0);
+    const std::string memory = ClockMismatch("memory", m_Options.expectedMemoryClockMHz, trace->meanMemoryClockMHz,
+        m_Monitor->SupportedMemoryClocks(), 0.01 * m_Options.expectedMemoryClockMHz);
+
+    for (const std::string& warning : {sm, memory})
+    {
+        if (!warning.empty())
+        {
+            std::cout << warning << "\n";
+        }
     }
 }
 

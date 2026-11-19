@@ -1,0 +1,31 @@
+{
+ "baseline": {"mean_temperature_c":65.51388888888887,"mean_w":114.44833333333332,"runs":3,"slope_w_per_c":0.0},
+ "board": {"clock_policy_ms_during_run":{"board-limit":0.0,"hw-power-brake":null,"hw-thermal":null,"reliability":0.0,"sw-power-cap":96823.90992,"sw-thermal":null},"ecc_enabled":null,"memory_power_w":null,"memory_temperature_c":null,"nvlink_low_power":null,"power_smoothing_enabled":null},
+ "compute_capability": "8.6",
+ "cuda_context": {"generic_compression_supported":true,"l2_fetch_granularity_bytes":64,"l2_persisting_set_aside_bytes":1179648},
+ "device": "NVIDIA GeForce RTX 3090",
+ "fit_min_duty_pct": 25,
+ "fits": [
+  {"duties":"100/25","fixed_w":-1.3725408740084788,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way","pj_per_access":44.74789973049964,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":2.1615314034185715,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way","pj_per_access":101.28699948654095,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":1.0284905466237007,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast16","pj_per_access":36.91589560031457,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":-0.47050826355877007,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast16","pj_per_access":68.1253172341498,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":-1.2239297256543935,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast2","pj_per_access":42.948692212022124,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":-2.4741793893876007,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast2","pj_per_access":80.3686507205365,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":-2.1421767285086304,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast32","pj_per_access":36.99016229126561,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":3.4483320794480505,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-1way-bcast32","pj_per_access":57.67123266171019,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":-4.409134779690287,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-8way","pj_per_access":62.000559879151915,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":-5.365651470991782,"footprint_bytes":8192,"level":"shared","operation":"ld.shared-8way","pj_per_access":183.35459171111324,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":-1.8100817671887128,"footprint_bytes":8192,"level":"shared","operation":"st.shared-1way","pj_per_access":52.27291204197209,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":-2.6599885241229657,"footprint_bytes":8192,"level":"shared","operation":"st.shared-1way","pj_per_access":116.49273322634862,"r2":null,"width_bytes":16},
+  {"duties":"100/25","fixed_w":-2.7076504008234927,"footprint_bytes":8192,"level":"shared","operation":"st.shared-8way","pj_per_access":81.46067102213175,"r2":null,"width_bytes":4},
+  {"duties":"100/25","fixed_w":-5.113072572165603,"footprint_bytes":8192,"level":"shared","operation":"st.shared-8way","pj_per_access":272.1626487690099,"r2":null,"width_bytes":16}
+ ],
+ "idle": [
+  {"label":"idle-noctx","memory_clock_mhz":810.0,"power_w":42.072168421052694,"sm_clock_mhz":1200.0,"temperature_c":58.0},
+  {"label":"idle-start","memory_clock_mhz":7271.371727748691,"power_w":97.32243979057586,"sm_clock_mhz":1200.0,"temperature_c":60.7434554973822},
+  {"label":"idle-end","memory_clock_mhz":7259.636842105263,"power_w":96.76092105263147,"sm_clock_mhz":1200.0,"temperature_c":64.48421052631579}
+ ],
+ "provenance": {"cuda_driver_version":"13.0","driver_version":"580.126.09","power_limit_w":350.0,"serial":null,"uuid":"GPU-7df088a1-fff4-ab84-ab61-fecb110faa53"},
+ "sm_clock_mhz": 1200.0
+}

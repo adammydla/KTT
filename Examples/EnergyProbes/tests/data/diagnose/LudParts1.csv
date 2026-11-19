@@ -1,0 +1,6 @@
+probe,operation,level,footprint_bytes,width_bytes,payload,active_sms,duty_pct,valid,power_w,baseline_w,duration_s,energy_j,sm_clock_mhz,clock_difference_pct,memory_clock_mhz,temperature_c,fan_pct,accesses_per_launch,launches,active_s,bandwidth_gbs,counter_power_w,trace_power_w,instant_power_w,average_power_w,trace_sm_clock_min_mhz,trace_sm_clock_max_mhz,clock_limiters,dynamic_energy_j,pj_per_access,registers,blocks_per_sm_fit,measure_s,power_settled,power_spread_pct,note
+idle-noctx,idle,idle,0,0,,all,-,1,40.40645789,,20,808.1291579,1200,,810,54,0,0,0,,,15.93587561,40.40645789,40.43292632,40.40645789,1200,1200,,,,,,,,,
+idle-start,idle,idle,0,0,,all,-,1,76.39964921,,20,1527.992984,1200,,5132.748691,57,0,0,0,,,25.8163393,76.39964921,73.34268586,76.39964921,1200,1200,,,,,,,,,
+sleep-0,sleep,baseline,0,0,,all,-,1,115.294,,0.20013419,23.0742713,1200,,9501,65.125,52,128214471,54,0.2001106727,,92.79992691,115.1602451,115.141451,115.1602451,1200,1200,,,,18,6,10.82205563,1,0.148995412,
+sleep-1,sleep,baseline,0,0,,all,-,1,114.922,,0.200133061,22.99969164,1200,,9501,64,53,128209976,55,0.2001067805,,94.31654073,114.9118835,114.914534,114.9118835,1200,1200,,,,18,6,11.02191994,1,0.09330271476,
+idle-end,idle,idle,0,0,,all,-,1,99.77483246,,20,1995.496649,1200,,7680.895288,62.68062827,52.82722513,0,0,,,32.60361327,99.77483246,97.80534555,99.77483246,1200,1200,,,,,,,,,

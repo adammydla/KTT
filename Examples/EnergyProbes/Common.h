@@ -56,8 +56,24 @@ enum ComputeOp : uint64_t
     ComputeFfma3 = 9,         // FFMA with three different register operands (acc = a * b + acc in real kernels)
     ComputeShfl = 10,         // warp shuffle
     ComputeBar = 11,          // block barrier
-    ComputeFfmaLoop = 12      // the FFMA chain in a loop that is not unrolled (branches)
+    ComputeFfmaLoop = 12,     // the FFMA chain in a loop that is not unrolled (branches)
+    // The other tensor-core paths, one warp instruction per step as HMMA (IMMA in the compute group, the others in the
+    // optional group "tensor").
+    ComputeImma = 13,         // mma.sync m16n8k32 s8 (sm_80+)
+    ComputeDmma = 14,         // mma.sync m8n8k4 f64 (sm_80+)
+    ComputeHmmaSparse = 15,   // mma.sp m16n8k32 f16, 2:4 sparsity (sm_80+)
+    ComputeQmmaFp8 = 16,      // mma.sync m16n8k32 e4m3 (native on sm_89 and sm_120 only)
+    ComputeOpcode = 17        // one SASS opcode (COMPUTE_OPCODE), the optional group "opcodes"
 };
+
+// COMPUTE_OPCODE of the opcode probes (kernels/Compute.cu): 1-based names, and whether a constant-operand variant exists.
+std::string OpcodeName(const uint64_t opcode);
+constexpr uint64_t OpcodeCount = 19;
+constexpr uint64_t OpcodeLastWithConstant = 7;
+// COMPUTE_OPCODE 20-22: FFMA with the same operand values in all chains, from 0, 1 or 2 shared registers (the operand
+// reuse cache), the optional group "reuse"; not part of the "opcodes" group.
+constexpr uint64_t OpcodeReuseFirst = 20;
+constexpr uint64_t OpcodeReuseLast = 22;
 
 // Must match WRITE_OP in kernels/Write.cu.
 enum WriteOp : uint64_t
@@ -93,6 +109,13 @@ void AppendNote(std::string& note, const std::string& text);
 std::string SignedPercent(const double fraction);
 
 std::string JoinList(const std::vector<uint64_t>& values, const std::string& separator);
+
+// Whether a clock ran where it was expected (Fan, Cosenza, Juurlink, ICPP'19: some clock pairs that NVML lists as
+// supported are not applied). Empty if `observedMHz` is within one clock step of `expectedMHz`, else a warning naming
+// both. One step: the distance from the supported clock nearest to `expectedMHz` to its nearest supported neighbour
+// (`supportedMHz`, NVML's list), or `fallbackStepMHz` without a list. Empty too if either value is unknown (NaN).
+std::string ClockMismatch(const std::string& domain, const double expectedMHz, const double observedMHz,
+    const std::vector<double>& supportedMHz, const double fallbackStepMHz);
 
 nlohmann::json ToJson(const double value);
 

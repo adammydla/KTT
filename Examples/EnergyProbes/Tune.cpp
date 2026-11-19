@@ -58,8 +58,37 @@ bool Contains(const std::vector<size_t>& indices, const size_t index)
     return std::find(indices.cbegin(), indices.cend(), index) != indices.cend();
 }
 
+// The energy-time trade-off: the Pareto front's points the model tells apart (ParetoSteps), and the choice.
+void PrintFront(const KernelRows& k, const EnergyRecommendation& choice,
+    const std::vector<size_t>& front, const std::vector<size_t>& steps, const Options& options)
+{
+    const auto& predictions = k.predictions;
+    std::cout << "  energy-time trade-off: " << front.size() << " configuration(s) on the Pareto front, " << steps.size()
+        << " told apart (each saves more than " << Text(options.contenderSd, 3) << " sd of energy\n  against the next "
+        << "faster one):\n    " << std::setw(10) << "t [ms]" << std::setw(12) << "E [J]" << std::setw(10) << "+- sd"
+        << std::setw(9) << "time" << std::setw(9) << "energy" << "  configuration\n";
+    const EnergyPrediction& fastest = predictions[front.front()];
+
+    for (const size_t i : front)
+    {
+        if (!Contains(steps, i) && i != choice.index)
+        {
+            continue;
+        }
+
+        const EnergyPrediction& p = predictions[i];
+        std::cout << "    " << std::setw(10) << Text(p.kernelS * 1e3, 4) << std::setw(12) << Text(p.energyJ, 4)
+            << std::setw(10) << Text(p.sdJ, 2) << std::setw(8) << Fixed(100.0 * (p.kernelS / fastest.kernelS - 1.0), 1)
+            << "%" << std::setw(8) << Fixed(100.0 * (p.energyJ / fastest.energyJ - 1.0), 1) << "%  " << p.label
+            << (i == choice.index ? "  [use]" : "") << (Contains(steps, i) ? "" : "  [not told apart from a faster one]")
+            << "\n";
+    }
+
+}
+
 // The model's choice, its contenders, how it compares with the fastest configuration, and the predictions' warnings.
-void PrintChoice(const KernelRows& k, const EnergyRecommendation& choice, const size_t fastest, const Options& options)
+void PrintChoice(const KernelRows& k, const EnergyRecommendation& choice, const size_t fastest,
+    const std::vector<size_t>& front, const std::vector<size_t>& steps, const Options& options)
 {
     const auto& predictions = k.predictions;
     const EnergyPrediction& best = predictions[choice.index];
@@ -90,6 +119,7 @@ void PrintChoice(const KernelRows& k, const EnergyRecommendation& choice, const 
             << " % energy, +" << Fixed(100.0 * (best.kernelS / predictions[fastest].kernelS - 1.0), 1) << " % time\n";
     }
 
+    PrintFront(k, choice, front, steps, options);
     const auto offClock = static_cast<size_t>(std::count_if(predictions.cbegin(), predictions.cend(), [](const auto& p)
     {
         return std::any_of(p.warnings.cbegin(), p.warnings.cend(), [](const std::string& w) { return w.rfind("SM clock", 0) == 0; });
@@ -127,7 +157,16 @@ void MeasureCandidates(const EnergyModel& model, KernelRows& k, const EnergyReco
 {
     const EnergyObjective objective = ObjectiveOf(options.objective);
     std::vector<size_t> candidates{choice.index};
-    candidates.insert(candidates.end(), choice.contenders.cbegin(), choice.contenders.cend());
+    // The contenders come best predicted first (Recommend), so a cap keeps the likeliest ones.
+    const size_t contenders = options.measureMax > 0 && options.tuneMeasure == "contenders"
+        ? std::min<size_t>(choice.contenders.size(), options.measureMax - 1) : choice.contenders.size();
+    candidates.insert(candidates.end(), choice.contenders.cbegin(), choice.contenders.cbegin() + contenders);
+
+    if (contenders < choice.contenders.size())
+    {
+        std::cout << "  measuring the choice and " << contenders << " of its " << choice.contenders.size()
+            << " contenders (--measure-max " << options.measureMax << ")\n";
+    }
 
     for (size_t i = 0; i < k.rows.size(); ++i)
     {
@@ -278,7 +317,9 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
     const double maxEnergyIncrease = options.maxEnergyIncreasePct.has_value() ? options.maxEnergyIncreasePct.value() / 100.0
         : NaN;
     std::cout << "\nModel: " << model.DeviceName() << " at " << Fixed(model.ClockMHz(), 0) << " MHz, relative sd of the "
-        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %, accounting " << options.accounting
+        << "dynamic energy " << Fixed(100.0 * model.RelativeSd(), 1) << " %, power limit "
+        << (std::isnan(model.PowerLimitW()) ? std::string("none") : Fixed(model.PowerLimitW(), 0) + " W")
+        << ", accounting " << options.accounting
         << (model.Accounting() == EnergyAccounting::AboveIdle ? " (idle " + Fixed(model.IdlePowerW(), 1) + " W)" : "") << "\n";
     std::vector<std::string> kernels;
 
@@ -308,8 +349,8 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
     }
 
     std::ofstream output(file);
-    output << "kernel,configuration,kernel_s,temperature_c,sm_clock_mhz,predicted_j,predicted_sd_j,predicted_dynamic_j,"
-        << "baseline_j,accounting,choice,measured_power_w,measured_s,measured_j,measured_temperature_c,measured_choice,"
+    output << "kernel,configuration,kernel_s,ktt_kernel_s,temperature_c,sm_clock_mhz,predicted_j,predicted_sd_j,predicted_dynamic_j,"
+        << "baseline_j,accounting,choice,pareto,measured_power_w,measured_s,measured_j,measured_temperature_c,measured_choice,"
         << "scaled_predicted_j,measured_wall_s,measured_busy,measured_role,note\n";
     bool failed = false;
 
@@ -332,9 +373,20 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
             }
         }
 
+        const auto pruned = std::count_if(all.cbegin(), all.cend(), [](const TuneRow* row)
+            { return row->note.find("(pruned)") != std::string::npos; });
         std::cout << "\n" << kernel << ": " << k.rows.size() << " of " << all.size() << " configurations predicted, objective "
             << options.objective << "\n";
+
+        if (pruned > 0)
+        {
+            std::cout << "  " << pruned << " not profiled: from their time alone above the best by more than the model's "
+                << "error (--no-prune profiles them)\n";
+        }
+
         EnergyRecommendation choice;
+        std::vector<size_t> front;
+        std::vector<size_t> steps;
         std::string problem;
         bool recommended = true;
 
@@ -363,7 +415,9 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
             const auto fastest = static_cast<size_t>(std::min_element(k.predictions.cbegin(), k.predictions.cend(),
                 [](const EnergyPrediction& a, const EnergyPrediction& b) { return a.kernelS < b.kernelS; })
                 - k.predictions.cbegin());
-            PrintChoice(k, choice, fastest, options);
+            front = ParetoFront(k.predictions);
+            steps = ParetoSteps(model, k.predictions, front, options.contenderSd);
+            PrintChoice(k, choice, fastest, front, steps, options);
 
             if (measure)
             {
@@ -384,11 +438,13 @@ int Report(const EnergyModel& fileModel, std::vector<TuneRow>& rows, const Optio
                 ? "contender" : "";
             const bool predicted = row->predicted && problem.empty();
             output << CsvText(row->kernel) << "," << CsvText(row->configuration) << "," << CsvValue(row->kernelS, 12) << ","
-                << CsvValue(row->temperatureC) << "," << CsvValue(row->smClockMHz) << ","
+                << CsvValue(row->kttKernelS, 12) << "," << CsvValue(row->temperatureC) << "," << CsvValue(row->smClockMHz) << ","
                 << CsvValue(predicted ? row->prediction.energyJ : NaN, 12) << ","
                 << CsvValue(predicted ? row->prediction.sdJ : NaN, 12) << ","
                 << CsvValue(predicted ? row->prediction.dynamicJ : NaN, 12) << ","
                 << CsvValue(predicted ? row->prediction.baselineJ : NaN, 12) << "," << options.accounting << "," << mark
+                << "," << (index >= k.rows.size() || !recommended ? "" : Contains(steps, index) ? "step"
+                    : Contains(front, index) ? "front" : "")
                 << "," << CsvValue(row->measuredPowerW) << "," << CsvValue(row->measuredS, 12) << ","
                 << CsvValue(row->measuredJ, 12) << "," << CsvValue(row->measuredTemperatureC) << "," << row->measuredChoice
                 << "," << CsvValue(row->scaledPredictedJ, 12) << "," << CsvValue(row->measuredWallS, 12) << ","
@@ -422,9 +478,17 @@ std::vector<std::string> SplitCsvLine(const std::string& line)
 
 } // namespace
 
+// The power limit to predict with: --power-limit (0 = none), else `fallback` (NaN = none).
+double PowerLimitOf(const Options& options, const double fallback)
+{
+    return options.powerLimitW.has_value() ? (options.powerLimitW.value() > 0.0 ? options.powerLimitW.value() : NaN)
+        : fallback;
+}
+
 int RunPredict(const Options& options)
 {
-    const EnergyModel model(options.modelFile);
+    EnergyModel model(options.modelFile);
+    model.SetPowerLimitW(PowerLimitOf(options, model.FilePowerLimitW()));
     std::ifstream input(options.predictCsv);
 
     if (!input)
@@ -553,10 +617,19 @@ int RunTune(const Options& options)
 
     std::cout << " on " << device << "\n";
 
+    // A model belongs to the GPU type it was calibrated on (another card of the type: tools/check_model.py). On another
+    // type its energies are off (the RTX 3090's on an RTX 2080 Ti: +19.5 % bias), so using it is an explicit choice. The
+    // name is the test because it is what the model file records; whether a model fits is check_model.py's question.
     if (device != model.DeviceName())
     {
+        if (!options.allowUncalibratedDevice)
+        {
+            throw std::runtime_error("the model was calibrated on " + model.DeviceName() + ", this GPU is " + device
+                + ": calibrate this GPU (README), or pass --allow-uncalibrated-device to use the model anyway");
+        }
+
         std::cout << "WARNING: the model was calibrated on " << model.DeviceName() << ", this GPU is " << device
-            << ": check it with tools/check_model.py\n";
+            << " (--allow-uncalibrated-device): its energies are not this GPU's; check it with tools/check_model.py\n";
     }
 
     // NVML directly: the GPU's power limit for the model, and the power of the candidates with --tune-measure.
@@ -575,11 +648,8 @@ int RunTune(const Options& options)
     }
 
     EnergyModel limited = model;
-
-    if (monitor != nullptr && monitor->GetPowerLimitW() > 0.0)
-    {
-        limited.SetPowerLimitW(monitor->GetPowerLimitW());
-    }
+    limited.SetPowerLimitW(PowerLimitOf(options, monitor != nullptr && monitor->GetPowerLimitW() > 0.0
+        ? monitor->GetPowerLimitW() : NaN));
 
     if (options.tuneMeasure != "none" && monitor == nullptr)
     {
@@ -616,12 +686,59 @@ int RunTune(const Options& options)
         energyTuner.TimeConfigurations(name, options.validateConfigs);
     }
 
-    std::vector<TuneRow> rows = energyTuner.CollectCounters(model.Counters(), options.outputPrefix);
+    // The empty kernel, for the power between launches (Validation.cpp), when candidates are measured.
+    if (options.tuneMeasure != "none")
+    {
+        const ValidationKernel gap = AddValidationKernel(tuner, LaunchGapKernel, kernelPrefix + "../Examples/");
+        energyTuner.AddKernel(LaunchGapKernel, gap.kernel, gap.definition, gap.compilerOptions);
+        energyTuner.TimeConfigurations(LaunchGapKernel, 1);
+    }
+
+    // The counter pass leaves out configurations that cannot be the choice (CounterPruning), unless --no-prune, every
+    // configuration is to be measured, or a limit on energy makes the admissible set depend on all energies.
+    EnergyModel choiceModel = limited;
+    choiceModel.SetAccounting(AccountingOf(options.accounting), options.idleW.value_or(NaN));
+    CounterPruning pruning;
+
+    if (options.prune && options.tuneMeasure != "all"
+        && (!options.maxEnergyIncreasePct.has_value() || options.objective == "energy"))
+    {
+        pruning.model = &choiceModel;
+        pruning.objective = ObjectiveOf(options.objective);
+        pruning.margin = ContenderMargin(choiceModel, options.contenderSd);
+        pruning.maxSlowdown = options.maxSlowdownPct.has_value() ? options.maxSlowdownPct.value() / 100.0 : NaN;
+
+        if (pruning.objective != EnergyObjective::Time && pruning.margin >= 0.0)
+        {
+            std::cout << "Counter pass: fastest first; a configuration predicted from its time alone to be more than "
+                << Fixed(100.0 * pruning.margin, 1) << " % above the best " << options.objective << " so far is not "
+                << "profiled (--no-prune)\n";
+        }
+    }
+
+    std::vector<TuneRow> rows = energyTuner.CollectCounters(model.Counters(), options.outputPrefix, pruning);
     Measure measure;
 
     if (options.tuneMeasure != "none")
     {
         const double seconds = static_cast<double>(options.validateMs) * 1e-3;
+        const auto gapRow = std::find_if(rows.begin(), rows.end(), [](const TuneRow& r) { return r.kernel == LaunchGapKernel; });
+
+        if (gapRow != rows.end())
+        {
+            energyTuner.MeasurePower(*gapRow, seconds);
+
+            if (gapRow->measuredPowerW > 0.0)
+            {
+                const double below = model.BaselineW(gapRow->measuredTemperatureC) - gapRow->measuredPowerW;
+                energyTuner.SetGapBelowBaselineW(below);
+                std::cout << "Power between launches: " << Text(gapRow->measuredPowerW, 4) << " W, " << Text(below, 3)
+                    << " W below the model's baseline\n";
+            }
+
+            rows.erase(gapRow);
+        }
+
         measure = [&energyTuner, seconds](TuneRow& row) { energyTuner.MeasurePower(row, seconds); };
     }
 

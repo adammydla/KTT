@@ -23,8 +23,22 @@ calibration's, which shows a driver or GPU that counts differently. The verdict:
   FAIL      times differ (another clock or memory configuration), the energies differ probe by probe, or the counts
             differ. Calibrate this GPU (README.md).
 
-Only probes that the run measured at a clock matching its own baseline count; with rows withheld for that reason the
-GPU's clock is not constant (not locked, or throttled), and a check at full rate cannot tell how the model does there.
+With --other-gpu NAME the run comes from another GPU type (2026-11-17, after Wattchmen's transfer of an energy table
+from a fraction of its benchmarks). Times and energies are expected to differ, so there is no verdict but TRANSFER:
+--write FILE writes the model with its energies times a factor per part of the GPU (compute, L1, shared memory, L2,
+DRAM: the median ratio of the run's probes of that part, the median of all probes for a part with fewer than
+GROUP_MIN_PROBES), this run's baseline and idle powers, and NAME as its GPU. Tested with the RTX 3090 model and the
+quick probes of the RTX 2080 Ti calibration run, on the 2080 Ti's validation run: total error 4.7 % against 4.5 % with
+the 2080 Ti's own calibration (one factor for all: 6.2 %; the 3090 model with only the 2080 Ti's baseline: 7.2 %), max
+regret 0.9 % for all of them, but the dynamic energy's median bias over the kernels +10.5 % against +3.2 %. Use it until the GPU is calibrated (80
+minutes); calibrate before comparing different kernels.
+
+Wattchmen's affine transfer (a line, slope and intercept, fitted on a random 10 % of the energies) was compared with
+this on the same data (2026-11-18, handoff/analysis_2026-11-18/affine_transfer) and is not used. On probe energies its
+negative intercept (-213 pJ) breaks the small probes (held-out median error 41-43 % against 7-9 % per part); on the
+event prices (a tenth or half of the 2080 Ti's own prices) it gave a total error of 11-14 % on the validation run,
+against 6-10 % with a median ratio and 4.6 % for this stand-in. A line fits across cooling setups of one chip (theirs,
+R^2 0.988), not across chips (3090 -> 2080 Ti: R^2 0.90).
 """
 
 import argparse
@@ -58,6 +72,25 @@ BASELINE_TOLERANCE = 0.03
 # agree within 0.5 % between runs on one GPU.
 COUNT_TOLERANCE = 0.05
 COUNT_FAIL = 0.10
+# --other-gpu: the parts of the GPU that get a factor of their own, by the first word of a probe's label, and the events
+# of each part. A part needs this many probes in the run, else it takes the median of all.
+GROUP_MIN_PROBES = 3
+PROBE_GROUPS = {"compute": "compute", "none": "compute", "L1": "L1", "shared": "shared", "L2": "L2", "DRAM": "DRAM"}
+
+
+def event_group(event):
+    """The part of the GPU an event belongs to, for --other-gpu (None: the median of all probes)."""
+    if event.startswith("DRAM"):
+        return "DRAM"
+    if event.startswith("L2"):
+        return "L2"
+    if event.startswith("shared") or event == "inst lsu shared":
+        return "shared"
+    if event.startswith("L1") or event in ("inst lsu global", "inst lsu other"):
+        return "L1"
+    if event.startswith("inst"):
+        return "compute"
+    return None
 COUNT_SHARE = 0.10
 
 
@@ -118,6 +151,14 @@ def compare_counts(model, rows):
     return found
 
 
+def run_idle(rows):
+    """Mean power of the run's idle rows: (without a CUDA context, with one); NaN where the run has none."""
+    def mean(probe):
+        values = [number(r["power_w"]) for r in rows if r["level"] == "idle" and r["probe"] == probe]
+        return statistics.mean(values) if values else math.nan
+    return mean("idle-noctx"), mean("idle-start")
+
+
 def run_baseline(rows):
     """Mean power and temperature of the run's sleep rows."""
     sleeps = [(number(r["power_w"]), number(r["temperature_c"])) for r in rows
@@ -135,6 +176,9 @@ def main():
                         "common factor and this run's baseline")
     parser.add_argument("--counters", help="prefix of a short profiled run on this GPU (--quick --profile): compare its "
                         "event counts per access with the calibration's")
+    parser.add_argument("--other-gpu", metavar="NAME", help="the run comes from another GPU type, NAME as NVML names it: "
+                        "no verdict but TRANSFER; --write writes the model scaled by the probes' median ratio, with this "
+                        "run's baseline and NAME as its GPU (see above)")
     parser.add_argument("--use-withheld", action="store_true",
                         help="also compare probes whose clock differed from the run's baseline (to look at an unlocked "
                              "GPU; their energies are biased by the baseline's clock, so no verdict follows)")
@@ -198,7 +242,16 @@ def main():
     if arguments.use_withheld:
         print("No verdict with --use-withheld: the energies above include rows at another clock than their baseline.")
         return 0
-    if len(slow) > 0.2 * len(found):
+    if arguments.other_gpu:
+        verdict = "TRANSFER"
+        print(f"TRANSFER: another GPU type ({arguments.other_gpu}). The energies differ from the model's by a median factor "
+              f"of {median:.3f} with a spread of {100 * spread:.1f} % around it; the transferred model (--write) ranks the "
+              "configurations of a kernel, its absolute energies are rougher than a calibration's. Calibrate this GPU "
+              "before comparing different kernels.")
+        if not counts_ok:
+            print("  WARNING: the event counts differ from the calibration GPU's: the events of those probes are counted "
+                  "differently here.")
+    elif len(slow) > 0.2 * len(found):
         verdict = "FAIL"
         print("FAIL: the probes run at another speed than in the calibration (another clock or memory configuration).")
     elif not counts_ok:
@@ -223,18 +276,43 @@ def main():
 
     if arguments.write and verdict != "FAIL":
         data = copy.deepcopy(model.data)
-        factor = median if verdict == "SCALED" else 1.0
-        for entry in data["events"].values():
-            entry["pj"] *= factor
+        factor = median if verdict in ("SCALED", "TRANSFER") else 1.0
+        factors = {}
+        if verdict == "TRANSFER":
+            parts = {}
+            for label, _, energy, _, _ in found:
+                parts.setdefault(PROBE_GROUPS.get(label.split()[0]), []).append(energy)
+            factors = {part: statistics.median(values) for part, values in parts.items()
+                       if part and len(values) >= GROUP_MIN_PROBES}
+            print("  factors per part: " + ", ".join(f"{part} {value:.3f} ({len(parts[part])} probes)"
+                                                     for part, value in sorted(factors.items()))
+                  + f"; other events {factor:.3f}")
+        for name, entry in data["events"].items():
+            entry["pj"] *= factors.get(event_group(name), factor)
         if not math.isnan(base_w):
             data["baseline"]["mean_w"] = base_w
             data["baseline"]["mean_temperature_c"] = base_t
+        if verdict == "TRANSFER":
+            # Another GPU: its name (so that --tune accepts the model there) and idle powers; the baseline's slope over
+            # temperature stays the calibration GPU's (a short run cannot measure it).
+            data["device"] = {"name": arguments.other_gpu, "sm_clock_mhz": data["device"].get("sm_clock_mhz"),
+                              "calibrated_on": data["device"]}
+            idle, context_idle = run_idle(rows)
+            if not math.isnan(idle):
+                data["baseline"]["idle_w"] = idle
+            if not math.isnan(context_idle):
+                data["baseline"]["context_idle_w"] = context_idle
         data["adjusted"] = {"from": os.path.basename(arguments.model), "run": os.path.basename(arguments.run),
-                            "energy_factor": factor, "probes": len(found), "verdict": verdict}
+                            "energy_factor": factor, "probes": len(found), "verdict": verdict,
+                            "energy_spread": spread}
+        if verdict == "TRANSFER":
+            data["adjusted"]["other_gpu"] = arguments.other_gpu
+            data["adjusted"]["factors"] = factors
         with open(arguments.write, "w") as file:
             json.dump(data, file, indent=1)
             file.write("\n")
-        print(f"Wrote {arguments.write} (energies x {factor:.3f}, baseline {data['baseline']['mean_w']:.1f} W at "
+        scaled = "the factors per part" if factors else f"{factor:.3f}"
+        print(f"Wrote {arguments.write} (energies x {scaled}, baseline {data['baseline']['mean_w']:.1f} W at "
               f"{data['baseline']['mean_temperature_c']:.1f} C)")
     return 0 if verdict != "FAIL" else 1
 

@@ -141,7 +141,10 @@ nlohmann::json EnergyTable(const std::vector<Row>& rows, const std::vector<Probe
         table["provenance"] = {{"driver_version", textOrNull(provenance.driverVersion)},
             {"cuda_driver_version", textOrNull(provenance.cudaDriverVersion)}, {"uuid", textOrNull(provenance.uuid)},
             {"serial", textOrNull(provenance.serial)}, {"power_limit_w", ToJson(provenance.powerLimitW)}};
+        table["board"] = monitor->GetBoard();
     }
+
+    table["cuda_context"] = DescribeCudaContext();
 
     return table;
 }

@@ -1,0 +1,20 @@
+{
+ "baseline": {"mean_temperature_c":63.52083333333333,"mean_w":112.589,"runs":2,"slope_w_per_c":0.0},
+ "board": {"clock_limited_ms_during_run":{"board-limit":0.0,"hw-power-brake":null,"hw-thermal":null,"reliability":0.0,"sw-power-cap":10997.497216,"sw-thermal":null},"ecc_enabled":null,"memory_power_w":null,"memory_temperature_c":null,"nvlink_low_power":null,"power_smoothing_enabled":null},
+ "compute_capability": "8.6",
+ "cuda_context": {"generic_compression_supported":true,"l2_fetch_granularity_bytes":64,"l2_persisting_set_aside_bytes":1179648},
+ "device": "NVIDIA GeForce RTX 3090",
+ "fit_min_duty_pct": 25,
+ "fits": [
+  {"duties":"100/25","fixed_w":1.1008338542118694,"footprint_bytes":0,"level":"compute","operation":"dmma","pj_per_access":76.0314382407788,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-1.5948384076904922,"footprint_bytes":0,"level":"compute","operation":"hmma-sparse","pj_per_access":81.71571290033042,"r2":null,"width_bytes":0},
+  {"duties":"100/25","fixed_w":-2.0931823085245327,"footprint_bytes":0,"level":"compute","operation":"imma","pj_per_access":103.7620551136006,"r2":null,"width_bytes":0}
+ ],
+ "idle": [
+  {"label":"idle-noctx","memory_clock_mhz":810.0,"power_w":40.048457894736835,"sm_clock_mhz":1200.0,"temperature_c":54.0},
+  {"label":"idle-start","memory_clock_mhz":7407.879581151832,"power_w":92.14318324607336,"sm_clock_mhz":1200.0,"temperature_c":56.8586387434555},
+  {"label":"idle-end","memory_clock_mhz":7635.392670157068,"power_w":93.73721989528809,"sm_clock_mhz":1200.0,"temperature_c":61.968586387434556}
+ ],
+ "provenance": {"cuda_driver_version":"13.0","driver_version":"580.126.09","power_limit_w":350.0,"serial":null,"uuid":"GPU-7df088a1-fff4-ab84-ab61-fecb110faa53"},
+ "sm_clock_mhz": 1200.0
+}

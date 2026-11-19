@@ -77,6 +77,10 @@ public:
     // model's clock: the GPU lowers its clock to hold the limit, and the energy is then about the limit times the time.
     // Predict() takes that value and adds a warning. NaN (the default) = no limit known.
     void SetPowerLimitW(const double watts) { m_PowerLimitW = watts; }
+    double PowerLimitW() const { return m_PowerLimitW; }
+    // The power limit NVML reported on the calibration GPU (the model file's device), NaN if it has none. --predict
+    // applies it unless --power-limit says otherwise; --tune takes NVML's limit of the GPU it runs on.
+    double FilePowerLimitW() const { return m_FilePowerLimitW; }
 
     // Which baseline the energy includes, and the idle power for AboveIdle (NaN = the file's idle power with a context;
     // Predict() throws if neither is known).
@@ -111,6 +115,9 @@ public:
 
     // The relative sd of the model's bias between kernels (the within-kernel sd if the file has none).
     double BetweenKernelsSd() const;
+
+    // The sd of the baseline power (W): its fit and, at an unknown temperature, the temperature's effect.
+    double BaselineSdW() const;
 
     // A kernel's measured scale: the mean of measured / predicted dynamic energy over at least `minimum` configurations
     // measured with NVML, from the predictions' unscaled dynamic energy (so a second call cannot compound a scale).
@@ -158,6 +165,7 @@ private:
     double m_BaselineSdW = 0.0;
     double m_UnknownTemperatureSdW = 0.0;
     double m_PowerLimitW = std::numeric_limits<double>::quiet_NaN();
+    double m_FilePowerLimitW = std::numeric_limits<double>::quiet_NaN();
     double m_BetweenKernelsSd = std::numeric_limits<double>::quiet_NaN();
     std::map<std::string, std::pair<double, size_t>> m_KernelScales; // scale and number of measurements
     double m_ContextIdleW = std::numeric_limits<double>::quiet_NaN();
@@ -171,3 +179,20 @@ private:
 EnergyAccounting AccountingOf(const std::string& name);
 
 double ObjectiveValue(const EnergyPrediction& prediction, EnergyObjective objective);
+
+// The configurations that no other one beats in both time and predicted energy, fastest first (energy_predictor.py
+// pareto_front). Over all predictions given, also those a limit of Recommend() excludes: the front is the trade-off.
+std::vector<size_t> ParetoFront(const std::vector<EnergyPrediction>& predictions);
+
+// The points of the front that the model can tell apart: from the fastest, each next one saves more than z standard
+// deviations (EnergyModel::PairSd) of energy against the last one kept (energy_predictor.py pareto_steps). The other
+// points of the front save less than the model's error.
+std::vector<size_t> ParetoSteps(const EnergyModel& model, const std::vector<EnergyPrediction>& predictions,
+    const std::vector<size_t>& front, double z = 2.0);
+
+// How far (relative) above the best objective value a configuration's value must be predicted to be sure it is neither
+// the choice nor a contender of Recommend() at z within one kernel: the m with m = z (r + b) sqrt((1 + m)^2 + 1), where r
+// is the relative sd of the dynamic energy and b the baseline's sd relative to the baseline power in the model's
+// accounting (both bound a configuration's sd from above as a fraction of its energy). NaN when the accounting has no
+// baseline (EnergyTuner's pruning then skips nothing).
+double ContenderMargin(const EnergyModel& model, double z = 2.0);

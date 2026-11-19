@@ -34,6 +34,9 @@ public:
     // NVML readings without a kernel for --idle-s seconds, as a row of level "idle" (with the monitor only).
     void MeasureIdle(const std::string& label);
 
+    // Compares the clocks of the warm-up under load with the expected ones (--expect-clock, --lock-clock): WarmUp calls it.
+    void CheckClocks() const;
+
     // Runs `kernel` for --warmup-s seconds without keeping its results.
     void WarmUp(const ktt::KernelId kernel);
 

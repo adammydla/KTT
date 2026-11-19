@@ -1,0 +1,16 @@
+{
+ "baseline": {"mean_temperature_c":67.8125,"mean_w":114.93299999999999,"runs":2,"slope_w_per_c":0.0},
+ "board": {"clock_policy_ms_during_run":{"board-limit":0.0,"hw-power-brake":null,"hw-thermal":null,"reliability":0.0,"sw-power-cap":41782.807424,"sw-thermal":null},"ecc_enabled":null,"memory_power_w":null,"memory_temperature_c":null,"nvlink_low_power":null,"power_smoothing_enabled":null},
+ "compute_capability": "8.6",
+ "cuda_context": {"generic_compression_supported":true,"l2_fetch_granularity_bytes":64,"l2_persisting_set_aside_bytes":1179648},
+ "device": "NVIDIA GeForce RTX 3090",
+ "fit_min_duty_pct": 25,
+ "fits": [],
+ "idle": [
+  {"label":"idle-noctx","memory_clock_mhz":810.0,"power_w":43.72174210526312,"sm_clock_mhz":1200.0,"temperature_c":60.0},
+  {"label":"idle-start","memory_clock_mhz":7089.361256544503,"power_w":93.4443246073297,"sm_clock_mhz":1200.0,"temperature_c":60.72251308900523},
+  {"label":"idle-end","memory_clock_mhz":7544.387434554974,"power_w":101.15358638743419,"sm_clock_mhz":1200.0,"temperature_c":66.64921465968587}
+ ],
+ "provenance": {"cuda_driver_version":"13.0","driver_version":"580.126.09","power_limit_w":350.0,"serial":null,"uuid":"GPU-7df088a1-fff4-ab84-ab61-fecb110faa53"},
+ "sm_clock_mhz": 1200.0
+}

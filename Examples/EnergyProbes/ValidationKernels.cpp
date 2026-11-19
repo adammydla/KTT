@@ -28,6 +28,27 @@ std::vector<float> RandomFloats(const size_t count, const float low, const float
     return values;
 }
 
+std::string& DataMode()
+{
+    static std::string mode = "example";
+    return mode;
+}
+
+// The floats a kernel reads: its own (example) values, zeros, or uniform in [0, 1) from the seed.
+std::vector<float> InputFloats(std::vector<float> example, const uint32_t seed)
+{
+    if (DataMode() == "zeros")
+    {
+        std::fill(example.begin(), example.end(), 0.0f);
+    }
+    else if (DataMode() == "random")
+    {
+        example = RandomFloats(example.size(), 0.0f, 1.0f, seed);
+    }
+
+    return example;
+}
+
 bool IsMultiple(const uint64_t a, const uint64_t b)
 {
     return b != 0 && a % b == 0;
@@ -42,7 +63,7 @@ ValidationKernel AddTranspose(ktt::Tuner& tuner, const std::string& directory)
         ktt::DimensionVector(width, height), ktt::DimensionVector(1, 1));
     const ktt::KernelId kernel = tuner.CreateSimpleKernel("Transpose", definition);
 
-    std::vector<float> src = RandomFloats(static_cast<size_t>(width) * height, 0.0f, 10.0f, 1);
+    std::vector<float> src = InputFloats(RandomFloats(static_cast<size_t>(width) * height, 0.0f, 10.0f, 1), 1001);
     std::vector<float> dst(src.size(), 0.0f);
     const ktt::ArgumentId srcId = tuner.AddArgumentVector(src, ktt::ArgumentAccessType::ReadOnly);
     const ktt::ArgumentId dstId = tuner.AddArgumentVector(dst, ktt::ArgumentAccessType::WriteOnly);
@@ -312,7 +333,7 @@ ValidationKernel AddReduction(ktt::Tuner& tuner, const std::string& directory)
         ktt::DimensionVector(n), ktt::DimensionVector(1));
     const ktt::KernelId kernel = tuner.CreateSimpleKernel("Reduction", definition);
 
-    const std::vector<float> src = RandomFloats(n, 0.0f, 1000.0f, 11);
+    const std::vector<float> src = InputFloats(RandomFloats(n, 0.0f, 1000.0f, 11), 1011);
     const std::vector<float> dst(16, 0.0f);
     const ktt::ArgumentId srcId = tuner.AddArgumentVector(src, ktt::ArgumentAccessType::ReadOnly);
     const ktt::ArgumentId dstId = tuner.AddArgumentVector(dst, ktt::ArgumentAccessType::ReadWrite);
@@ -620,14 +641,469 @@ ValidationKernel AddKtConvolution(ktt::Tuner& tuner, const std::string& director
     return {"ktconvolution", kernel, definition, ""};
 }
 
+// The third held-out set (--validate heldout3; NEXT_STEPS_PLAN M6, restored for the frozen evaluation of the Kimi review
+// P4, 2026-11-16): PolyBench/GPU kernels with a small tuning space each (kernels/HeldOut3.cu, the file measured on
+// 2026-11-14). Sizes: PolyBench's standard data sets, the 2-D convolution doubled to 8192 x 8192 so that a launch takes
+// milliseconds. No part of the model is fitted or calibrated on them.
+ValidationKernel AddPolyBench(ktt::Tuner& tuner, const std::string& name, const std::string& examplesDirectory)
+{
+    const std::string file = examplesDirectory + "EnergyProbes/kernels/HeldOut3.cu";
+    const auto blocks = [](const uint64_t size, const uint64_t per) { return (size + per - 1) / per; };
+    ktt::KernelDefinitionId definition = 0;
+    std::vector<ktt::ArgumentId> arguments;
+    uint64_t sizeX = 0;
+    uint64_t sizeY = 1;
+
+    if (name == "gesummv")
+    {
+        const int n = 4096;
+        definition = tuner.AddKernelDefinitionFromFile("gesummv", file, ktt::DimensionVector(1), ktt::DimensionVector(1));
+        const size_t square = static_cast<size_t>(n) * n;
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(1.5f), tuner.AddArgumentScalar(1.2f),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 41), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 42), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), ktt::ArgumentAccessType::ReadWrite),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 43), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = n;
+    }
+    else if (name == "syrk" || name == "syr2k")
+    {
+        const int ni = 1024;
+        const int nj = 1024;
+        const size_t elements = static_cast<size_t>(ni) * nj;
+        definition = tuner.AddKernelDefinitionFromFile(name, file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(ni), tuner.AddArgumentScalar(nj), tuner.AddArgumentScalar(1.5f),
+            tuner.AddArgumentScalar(1.2f),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 44), ktt::ArgumentAccessType::ReadOnly)};
+        if (name == "syr2k")
+        {
+            arguments.push_back(tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 45),
+                ktt::ArgumentAccessType::ReadOnly));
+        }
+        arguments.push_back(tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(ni) * ni, 0.0f, 1.0f, 46),
+            ktt::ArgumentAccessType::ReadWrite));
+        sizeX = ni;
+        sizeY = ni;
+    }
+    else if (name == "conv2d")
+    {
+        const int ni = 8192;
+        const int nj = 8192;
+        const size_t elements = static_cast<size_t>(ni) * nj;
+        definition = tuner.AddKernelDefinitionFromFile("conv2d", file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(ni), tuner.AddArgumentScalar(nj),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 47), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(elements, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = nj;
+        sizeY = ni;
+    }
+    else
+    {
+        const int n = 256;
+        const size_t elements = static_cast<size_t>(n) * n * n;
+        definition = tuner.AddKernelDefinitionFromFile("conv3d", file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n),
+            tuner.AddArgumentVector(RandomFloats(elements, 0.0f, 1.0f, 48), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<float>(elements, 0.0f), ktt::ArgumentAccessType::ReadWrite)};
+        sizeX = n;
+        sizeY = n;
+    }
+
+    tuner.SetArguments(definition, arguments);
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("PolyBench_" + name, definition);
+    const bool twoD = name != "gesummv";
+    tuner.AddParameter(kernel, "BLOCK_X", name == "gesummv" ? std::vector<uint64_t>{32, 64, 128, 256, 512, 1024}
+        : name == "syrk" || name == "syr2k" ? std::vector<uint64_t>{8, 16, 32, 64} : std::vector<uint64_t>{16, 32, 64, 128, 256});
+    tuner.AddParameter(kernel, "BLOCK_Y", twoD ? (name == "conv3d" ? std::vector<uint64_t>{1, 2, 4, 8}
+        : std::vector<uint64_t>{1, 2, 4, 8, 16, 32}) : std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "UNROLL", name == "gesummv" ? std::vector<uint64_t>{1, 2, 4, 8} : std::vector<uint64_t>{1, 4});
+    tuner.AddParameter(kernel, "ACC_REGISTER", name == "gesummv" || name == "syrk" || name == "syr2k"
+        ? std::vector<uint64_t>{0, 1} : std::vector<uint64_t>{0});
+    tuner.AddParameter(kernel, "ITEMS_Y", name == "conv2d" ? std::vector<uint64_t>{1, 2, 4} : std::vector<uint64_t>{1});
+    tuner.AddConstraint(kernel, {"BLOCK_X", "BLOCK_Y"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] >= 32 && v[0] * v[1] <= 1024; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [sizeX, blocks](const uint64_t, const std::vector<uint64_t>& v) { return blocks(sizeX, v[0]); });
+
+    if (twoD)
+    {
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y, {"BLOCK_Y"},
+            [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y,
+            {"BLOCK_Y", "ITEMS_Y"}, [sizeY, blocks](const uint64_t, const std::vector<uint64_t>& v)
+            { return blocks(sizeY, v[0] * v[1]); });
+    }
+
+    return {name, kernel, definition, ""};
+}
+
+// An empty kernel, for the power between launches (kernels/LaunchGap.cu, Validation.cpp).
+ValidationKernel AddLaunchGap(ktt::Tuner& tuner, const std::string& examplesDirectory)
+{
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("launchGap",
+        examplesDirectory + "EnergyProbes/kernels/LaunchGap.cu", ktt::DimensionVector(1), ktt::DimensionVector(32));
+    tuner.SetArguments(definition, {tuner.AddArgumentScalar(0)});
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("LaunchGap", definition);
+    tuner.AddParameter(kernel, "GAP", std::vector<uint64_t>{1});
+    return {LaunchGapKernel, kernel, definition, ""};
+}
+
+// The fourth held-out set (kernels/HeldOut4.cu, 2026-11-17): written and measured before the model change it scores.
+ValidationKernel AddPolyBench4(ktt::Tuner& tuner, const std::string& name, const std::string& examplesDirectory)
+{
+    const std::string file = examplesDirectory + "EnergyProbes/kernels/HeldOut4.cu";
+    const auto blocks = [](const uint64_t size, const uint64_t per) { return (size + per - 1) / per; };
+    const auto read = ktt::ArgumentAccessType::ReadOnly;
+    const auto write = ktt::ArgumentAccessType::ReadWrite;
+    const int n = 8192;
+    const size_t square = static_cast<size_t>(n) * n;
+    std::vector<ktt::ArgumentId> arguments;
+    uint64_t sizeX = n;
+    uint64_t sizeY = 1;
+    const bool twoD = name == "jacobi2d" || name == "fdtd2d";
+    const ktt::KernelDefinitionId definition = twoD
+        ? tuner.AddKernelDefinitionFromFile(name, file, ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1))
+        : tuner.AddKernelDefinitionFromFile(name, file, ktt::DimensionVector(1), ktt::DimensionVector(1));
+
+    if (name == "atax1")
+    {
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 51), read),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 52), read),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), write)};
+    }
+    else if (name == "mvt2")
+    {
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 53), read),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 54), write),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 55), read)};
+    }
+    else if (name == "jacobi2d")
+    {
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 56), read),
+            tuner.AddArgumentVector(std::vector<float>(square, 0.0f), write)};
+        sizeY = n;
+    }
+    else if (name == "fdtd2d")
+    {
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(n),
+            tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(n) * (n + 1), 0.0f, 1.0f, 57), read),
+            tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(n + 1) * n, 0.0f, 1.0f, 58), read),
+            tuner.AddArgumentVector(RandomFloats(square, 0.0f, 1.0f, 59), write)};
+        sizeY = n;
+    }
+    else
+    {
+        const int rows = 2048;
+        arguments = {tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(rows),
+            tuner.AddArgumentScalar(static_cast<float>(rows)), tuner.AddArgumentScalar(0.005f),
+            tuner.AddArgumentVector(RandomFloats(n, 0.0f, 1.0f, 60), read),
+            tuner.AddArgumentVector(std::vector<float>(n, 0.0f), write),
+            tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(rows) * n, 0.0f, 1.0f, 61), read)};
+    }
+
+    tuner.SetArguments(definition, arguments);
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("PolyBench_" + name, definition);
+    const bool accumulates = name == "atax1" || name == "mvt2" || name == "corrstd";
+    tuner.AddParameter(kernel, "BLOCK_X", name == "atax1" ? std::vector<uint64_t>{32, 64, 128, 256, 512}
+        : accumulates ? std::vector<uint64_t>{32, 64, 128, 256, 512, 1024} : std::vector<uint64_t>{16, 32, 64, 128, 256});
+    tuner.AddParameter(kernel, "BLOCK_Y", twoD ? std::vector<uint64_t>{1, 2, 4, 8, 16} : std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "UNROLL", accumulates ? std::vector<uint64_t>{1, 2, 4, 8} : std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "ACC_REGISTER", accumulates ? std::vector<uint64_t>{0, 1} : std::vector<uint64_t>{0});
+    tuner.AddParameter(kernel, "ITEMS_Y", name == "jacobi2d" ? std::vector<uint64_t>{1, 2, 4} : std::vector<uint64_t>{1});
+    tuner.AddConstraint(kernel, {"BLOCK_X", "BLOCK_Y"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] >= 32 && v[0] * v[1] <= 1024; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X, {"BLOCK_X"},
+        [sizeX, blocks](const uint64_t, const std::vector<uint64_t>& v) { return blocks(sizeX, v[0]); });
+
+    if (twoD)
+    {
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y, {"BLOCK_Y"},
+            [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y,
+            {"BLOCK_Y", "ITEMS_Y"}, [sizeY, blocks](const uint64_t, const std::vector<uint64_t>& v)
+            { return blocks(sizeY, v[0] * v[1]); });
+    }
+
+    return {name, kernel, definition, ""};
+}
+
+// The fifth held-out set (2026-11-17): the CUDA kernels of KTT examples not used before, with the examples' sources
+// unchanged and their tuning spaces copied from the examples' programs. Written and measured with the shipped model of
+// 2026-11-17 fixed; nothing is fitted on them.
+
+// The values of 1..n that divide n. The ATF examples give every size parameter the range 1..n and keep only divisors of the
+// input size through their constraints (a tile divides the input, a sub-tile the tile, and so on); listing the divisors
+// directly gives the same space without KTT generating n^2 candidates per pair.
+std::vector<uint64_t> Divisors(const uint64_t n)
+{
+    std::vector<uint64_t> values;
+
+    for (uint64_t i = 1; i <= n; ++i)
+    {
+        if (n % i == 0)
+        {
+            values.push_back(i);
+        }
+    }
+
+    return values;
+}
+
+// ATF's generated Gaussian convolution (AtfSamples/GaussianStatic1.cu, the example's "Convolution" sample): a 5 x 5 stencil
+// over 8196 x 8196 floats into 8192 x 8192 (the example's 4096 x 4096 takes a fraction of a millisecond). Tile sizes per
+// work-group (L_CB) and per thread (P_CB), number of blocks and threads per dimension, which dimension maps to x, input tiles
+// cached in shared memory or registers, and where partial results live (registers, shared or global). Added to the example's
+// constraints, so that every configuration launches and compiles: 32-1024 threads per block, at least 82 x 256 threads in all
+// (a single block over 67 M outputs takes seconds), the shared tiles within 48 KiB and the register tiles within 512 floats.
+ValidationKernel AddAtfConvolution(ktt::Tuner& tuner, const std::string& directory)
+{
+    const uint64_t size = 8192;
+    const size_t inputs = static_cast<size_t>(size + 4) * (size + 4);
+    const size_t outputs = static_cast<size_t>(size) * size;
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("gaussian_1",
+        directory + "AtfSamples/GaussianStatic1.cu", ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("AtfConvolution", definition);
+    std::vector<float> in(inputs);
+
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        in[i] = static_cast<float>((i % 100) + 1);
+    }
+
+    in = InputFloats(std::move(in), 1081);
+    tuner.SetArguments(definition, {tuner.AddArgumentVector(in, ktt::ArgumentAccessType::ReadOnly),
+        tuner.AddArgumentVector(std::vector<float>(outputs, 0.0f), ktt::ArgumentAccessType::ReadWrite),
+        tuner.AddArgumentVector(std::vector<float>(outputs, 0.0f), ktt::ArgumentAccessType::ReadWrite)});
+
+    const std::vector<uint64_t> divisors = Divisors(size);
+    tuner.AddParameter(kernel, "CACHE_L_CB", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "CACHE_P_CB", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "G_CB_RES_DEST_LEVEL", std::vector<uint64_t>{2});
+    tuner.AddParameter(kernel, "L_CB_RES_DEST_LEVEL", std::vector<uint64_t>{2, 1, 0});
+    tuner.AddParameter(kernel, "P_CB_RES_DEST_LEVEL", std::vector<uint64_t>{2, 1, 0});
+    tuner.AddParameter(kernel, "OCL_DIM_L_1", std::vector<uint64_t>{0, 1});
+    tuner.AddParameter(kernel, "OCL_DIM_L_2", std::vector<uint64_t>{0, 1});
+
+    for (const std::string dimension : {"1", "2"})
+    {
+        tuner.AddParameter(kernel, "INPUT_SIZE_L_" + dimension, std::vector<uint64_t>{size});
+        tuner.AddParameter(kernel, "L_CB_SIZE_L_" + dimension, divisors);
+        tuner.AddParameter(kernel, "P_CB_SIZE_L_" + dimension, divisors);
+        tuner.AddParameter(kernel, "NUM_WG_L_" + dimension, divisors);
+        tuner.AddParameter(kernel, "NUM_WI_L_" + dimension, divisors);
+    }
+
+    tuner.AddParameter(kernel, "L_REDUCTION", std::vector<uint64_t>{1});
+    tuner.AddParameter(kernel, "P_WRITE_BACK", std::vector<uint64_t>{0});
+    tuner.AddParameter(kernel, "L_WRITE_BACK", std::vector<uint64_t>{2});
+
+    // The example's constraints.
+    tuner.AddConstraint(kernel, {"G_CB_RES_DEST_LEVEL", "L_CB_RES_DEST_LEVEL", "P_CB_RES_DEST_LEVEL"},
+        [](const std::vector<uint64_t>& v) { return v[0] >= v[1] && v[1] >= v[2]; });
+    tuner.AddConstraint(kernel, {"OCL_DIM_L_1", "OCL_DIM_L_2"}, [](const std::vector<uint64_t>& v) { return v[0] != v[1]; });
+
+    for (const std::string d : {"1", "2"})
+    {
+        tuner.AddConstraint(kernel, {"P_CB_SIZE_L_" + d, "L_CB_SIZE_L_" + d}, [](const std::vector<uint64_t>& v)
+            { return v[1] % v[0] == 0; });
+        tuner.AddConstraint(kernel, {"NUM_WG_L_" + d, "INPUT_SIZE_L_" + d, "L_CB_SIZE_L_" + d},
+            [](const std::vector<uint64_t>& v) { return (v[1] / v[2]) % v[0] == 0; });
+        tuner.AddConstraint(kernel, {"NUM_WI_L_" + d, "L_CB_SIZE_L_" + d, "P_CB_SIZE_L_" + d},
+            [](const std::vector<uint64_t>& v) { return (v[1] / v[2]) % v[0] == 0; });
+        tuner.AddConstraint(kernel, {"NUM_WI_L_" + d, "INPUT_SIZE_L_" + d, "NUM_WG_L_" + d},
+            [](const std::vector<uint64_t>& v) { return v[0] <= (v[1] + v[2] - 1) / v[2]; });
+    }
+
+    // Added: launchable blocks, enough threads, and tiles that fit (the cached input tile of a dimension holds
+    // L_CB / NUM_WI iterations of NUM_WI + 4 values, the register tile P_CB iterations of 5).
+    tuner.AddConstraint(kernel, {"NUM_WI_L_1", "NUM_WI_L_2"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] >= 32 && v[0] * v[1] <= 1024; });
+    tuner.AddConstraint(kernel, {"NUM_WG_L_1", "NUM_WI_L_1", "NUM_WG_L_2", "NUM_WI_L_2"}, [](const std::vector<uint64_t>& v)
+        { return v[0] * v[1] * v[2] * v[3] >= 82 * 256; });
+    tuner.AddConstraint(kernel, {"CACHE_L_CB", "L_CB_RES_DEST_LEVEL", "P_CB_RES_DEST_LEVEL", "L_CB_SIZE_L_1", "NUM_WI_L_1",
+        "L_CB_SIZE_L_2", "NUM_WI_L_2"}, [](const std::vector<uint64_t>& v)
+    {
+        const uint64_t cached = v[0] ? (v[3] + 4 * v[3] / v[4]) * (v[5] + 4 * v[5] / v[6]) : 0;
+        const uint64_t results = (v[1] == 1 || v[2] == 1) ? v[3] * v[5] : 0;
+        return 4 * (cached + results) <= 48 * 1024;
+    });
+    tuner.AddConstraint(kernel, {"CACHE_P_CB", "L_CB_RES_DEST_LEVEL", "P_CB_RES_DEST_LEVEL", "P_CB_SIZE_L_1", "P_CB_SIZE_L_2"},
+        [](const std::vector<uint64_t>& v)
+    {
+        const uint64_t cached = v[0] ? 25 * v[3] * v[4] : 0;
+        const uint64_t results = (v[1] == 0 || v[2] == 0) ? v[3] * v[4] : 0;
+        return cached + results <= 512;
+    });
+
+    // The example's modifiers (OpenCL work-items); here blocks: NUM_WG of the dimension that maps to x or y.
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X,
+        {"OCL_DIM_L_1", "NUM_WG_L_1", "OCL_DIM_L_2", "NUM_WG_L_2"}, [](const uint64_t, const std::vector<uint64_t>& v)
+        { return (v[0] == 0) * v[1] + (v[2] == 0) * v[3]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::Y,
+        {"OCL_DIM_L_1", "NUM_WG_L_1", "OCL_DIM_L_2", "NUM_WG_L_2"}, [](const uint64_t, const std::vector<uint64_t>& v)
+        { return (v[0] == 1) * v[1] + (v[2] == 1) * v[3]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X,
+        {"OCL_DIM_L_1", "NUM_WI_L_1", "OCL_DIM_L_2", "NUM_WI_L_2"}, [](const uint64_t, const std::vector<uint64_t>& v)
+        { return (v[0] == 0) * v[1] + (v[2] == 0) * v[3]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::Y,
+        {"OCL_DIM_L_1", "NUM_WI_L_1", "OCL_DIM_L_2", "NUM_WI_L_2"}, [](const uint64_t, const std::vector<uint64_t>& v)
+        { return (v[0] == 1) * v[1] + (v[2] == 1) * v[3]; });
+    return {"atfconv", kernel, definition, ""};
+}
+
+// Random 32-bit keys, as the Sort example draws them; zeros with --validate-data zeros (random keys are both the example's
+// data and the random mode).
+std::vector<uint32_t> RandomKeys(const size_t count, const uint32_t seed)
+{
+    std::vector<uint32_t> values(count, 0);
+
+    if (DataMode() != "zeros")
+    {
+        std::mt19937 engine(seed);
+        std::generate(values.begin(), values.end(), [&]() { return static_cast<uint32_t>(engine()); });
+    }
+
+    return values;
+}
+
+// The first pass of the Sort example's radix sort (Sort/Sort.cu, "reduce"): per block, a histogram of one 4-bit digit of
+// 256 Mi keys (1 GiB, the example's 32 MiB takes 0.05 ms), counted in registers per thread and summed in shared memory.
+// The example's space: LOCAL_SIZE threads per block, GLOBAL_SIZE threads in all (blocks = GLOBAL_SIZE / LOCAL_SIZE).
+ValidationKernel AddSortReduce(ktt::Tuner& tuner, const std::string& directory)
+{
+    const int n = 256 * 1024 * 1024;
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("reduce", directory + "Sort/Sort.cu",
+        ktt::DimensionVector(1), ktt::DimensionVector(1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("SortReduce", definition);
+    tuner.SetArguments(definition, {tuner.AddArgumentVector(RandomKeys(n, 71), ktt::ArgumentAccessType::ReadOnly),
+        tuner.AddArgumentVector(std::vector<uint32_t>(16 * 32768 / 128, 0), ktt::ArgumentAccessType::ReadWrite),
+        tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(0)});
+
+    tuner.AddParameter(kernel, "FPVECTNUM", std::vector<uint64_t>{4});
+    tuner.AddParameter(kernel, "LOCAL_SIZE", std::vector<uint64_t>{128, 256, 512});
+    tuner.AddParameter(kernel, "GLOBAL_SIZE", std::vector<uint64_t>{512, 1024, 2048, 4096, 8192, 16384, 32768});
+    tuner.AddConstraint(kernel, {"LOCAL_SIZE", "GLOBAL_SIZE"}, [](const std::vector<uint64_t>& v)
+        { return v[0] != 128 || v[1] != 32768; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {"LOCAL_SIZE"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X,
+        {"LOCAL_SIZE", "GLOBAL_SIZE"}, [](const uint64_t, const std::vector<uint64_t>& v) { return v[1] / v[0]; });
+    return {"sortreduce", kernel, definition, ""};
+}
+
+// Two kernels of the Sort2 example's radix sort (Sort2/Sort2.cu, after CUDPP) over 128 Mi keys and values (512 MiB each;
+// the example's 32 MiB takes well under a millisecond). The file has every kernel of the sort, so the macros of the other
+// kernels' parameters are set to one valid value through the compiler options.
+//   radixblocks (radixSortBlocks): every block sorts SORT_VECTOR x SORT_BLOCK_SIZE keys with their values by 4 bits in
+//     shared memory (four split passes, each a block-wide scan with a barrier per step).
+//   radixoffsets (findRadixOffsets): every block finds where each of the 16 digits starts in its SCAN_VECTOR x
+//     SCAN_BLOCK_SIZE block-sorted keys and writes the counts and offsets. Its input is block-sorted: the low 4 bits rise
+//     within every 8192 keys, the largest block of the space.
+// The example's space for each kernel's own parameters: block size 32-1024, vector width 2, 4 or 8.
+ValidationKernel AddRadixSort(ktt::Tuner& tuner, const std::string& name, const std::string& directory)
+{
+    const uint32_t n = 128u * 1024 * 1024;
+    const bool blocks = name == "radixblocks";
+    const std::string prefix = blocks ? "SORT" : "SCAN";
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile(blocks ? "radixSortBlocks" : "findRadixOffsets",
+        directory + "Sort2/Sort2.cu", ktt::DimensionVector(1), ktt::DimensionVector(1));
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel(blocks ? "RadixSortBlocks" : "FindRadixOffsets", definition);
+    const auto readWrite = ktt::ArgumentAccessType::ReadWrite;
+
+    if (blocks)
+    {
+        tuner.SetArguments(definition, {tuner.AddArgumentScalar(4u), tuner.AddArgumentScalar(0u),
+            tuner.AddArgumentVector(std::vector<uint32_t>(n, 0), readWrite),
+            tuner.AddArgumentVector(std::vector<uint32_t>(n, 0), readWrite),
+            tuner.AddArgumentVector(RandomKeys(n, 72), ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(RandomKeys(n, 73), ktt::ArgumentAccessType::ReadOnly)});
+    }
+    else
+    {
+        std::vector<uint32_t> keys = RandomKeys(n, 74);
+
+        for (size_t i = 0; i < keys.size(); ++i)
+        {
+            keys[i] = DataMode() == "zeros" ? 0u : (keys[i] & ~0xFu) | static_cast<uint32_t>((i % 8192) * 16 / 8192);
+        }
+
+        // Counters and offsets: 16 per block, for the most blocks (vector 2, 32 threads); the kernel indexes the counters
+        // digit-major with totalBlocks as the stride, so that is passed as the largest block count.
+        const uint32_t mostBlocks = n / (2 * 32);
+        tuner.SetArguments(definition, {tuner.AddArgumentVector(keys, ktt::ArgumentAccessType::ReadOnly),
+            tuner.AddArgumentVector(std::vector<uint32_t>(16 * static_cast<size_t>(mostBlocks), 0), readWrite),
+            tuner.AddArgumentVector(std::vector<uint32_t>(16 * static_cast<size_t>(mostBlocks), 0), readWrite),
+            tuner.AddArgumentScalar(0u), tuner.AddArgumentScalar(n), tuner.AddArgumentScalar(mostBlocks)});
+    }
+
+    tuner.AddParameter(kernel, prefix + "_BLOCK_SIZE", std::vector<uint64_t>{32, 64, 128, 256, 512, 1024});
+    tuner.AddParameter(kernel, prefix + "_VECTOR", std::vector<uint64_t>{2, 4, 8});
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, ktt::ModifierDimension::X, {prefix + "_BLOCK_SIZE"},
+        [](const uint64_t, const std::vector<uint64_t>& v) { return v[0]; });
+    tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, ktt::ModifierDimension::X,
+        {prefix + "_BLOCK_SIZE", prefix + "_VECTOR"}, [n](const uint64_t, const std::vector<uint64_t>& v)
+        { return n / (v[0] * v[1]); });
+    const std::string other = blocks ? "SCAN" : "SORT";
+    return {name, kernel, definition, "-D" + other + "_BLOCK_SIZE=256 -D" + other + "_VECTOR=4"};
+}
+
+// Rodinia's lud_internal and parts of it (kernels/LudParts.cu, 2026-11-18): a diagnosis of the largest miss of the
+// whole-application validation, run steadily at five of lud's steps, from the first (1023 x 1023 blocks) to the last
+// ones (49 blocks). Nothing is fitted on it.
+ValidationKernel AddLudInternal(ktt::Tuner& tuner, const std::string& directory)
+{
+    const int n = 16384;
+    const ktt::KernelDefinitionId definition = tuner.AddKernelDefinitionFromFile("ludInternal",
+        directory + "EnergyProbes/kernels/LudParts.cu", ktt::DimensionVector(1, 1), ktt::DimensionVector(1, 1));
+    tuner.SetArguments(definition, {tuner.AddArgumentVector(RandomFloats(static_cast<size_t>(n) * n, 0.0f, 1.0f, 71),
+        ktt::ArgumentAccessType::ReadWrite), tuner.AddArgumentScalar(n)});
+    const ktt::KernelId kernel = tuner.CreateSimpleKernel("LudInternal", definition);
+    tuner.AddParameter(kernel, "LUD_PART", std::vector<uint64_t>{0, 1, 2});
+    tuner.AddParameter(kernel, "LUD_OFFSET", std::vector<uint64_t>{0, 12288, 15360, 16000, 16256});
+    const auto blocks = [n](const uint64_t, const std::vector<uint64_t>& v) { return (n - v[0]) / 16 - 1; };
+    const auto block = [](const uint64_t, const std::vector<uint64_t>&) { return uint64_t{16}; };
+
+    for (const auto dimension : {ktt::ModifierDimension::X, ktt::ModifierDimension::Y})
+    {
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Local, dimension, {"LUD_OFFSET"}, block);
+        tuner.AddThreadModifier(kernel, {definition}, ktt::ModifierType::Global, dimension, {"LUD_OFFSET"}, blocks);
+    }
+
+    return {"ludinternal", kernel, definition, ""};
+}
+
 } // namespace
 
 const std::vector<std::pair<std::string, std::vector<std::string>>>& ValidationKernelSets()
 {
     static const std::vector<std::pair<std::string, std::vector<std::string>>> sets = {
         {"all", {"transpose", "gemm", "nbody", "coulomb"}}, {"heldout", {"reduction", "convolution", "pnpoly"}},
-        {"heldout2", {"bicg", "ktconvolution"}}};
+        {"heldout2", {"bicg", "ktconvolution"}}, {"heldout3", {"gesummv", "syrk", "syr2k", "conv2d", "conv3d"}},
+        {"heldout4", {"atax1", "mvt2", "jacobi2d", "fdtd2d", "corrstd"}},
+        {"heldout5", {"atfconv", "sortreduce", "radixblocks", "radixoffsets"}}, {"diagnose", {"ludinternal"}}};
     return sets;
+}
+
+void SetValidationData(const std::string& mode)
+{
+    if (mode != "example" && mode != "zeros" && mode != "random")
+    {
+        throw std::runtime_error("unknown validation data " + mode);
+    }
+
+    DataMode() = mode;
+}
+
+bool SupportsDataMode(const std::string& name)
+{
+    return name == "transpose" || name == "reduction" || name == "atfconv" || name == "sortreduce" || name == "radixblocks"
+        || name == "radixoffsets";
 }
 
 ValidationKernel AddValidationKernel(ktt::Tuner& tuner, const std::string& name, const std::string& examplesDirectory)
@@ -635,7 +1111,21 @@ ValidationKernel AddValidationKernel(ktt::Tuner& tuner, const std::string& name,
     using Add = ValidationKernel (*)(ktt::Tuner&, const std::string&);
     const std::map<std::string, Add> kernels = {{"transpose", AddTranspose}, {"gemm", AddGemm}, {"nbody", AddNbody},
         {"coulomb", AddCoulomb}, {"reduction", AddReduction}, {"convolution", AddConvolution}, {"pnpoly", AddPnpoly},
-        {"bicg", AddBicg}, {"ktconvolution", AddKtConvolution}};
+        {"bicg", AddBicg}, {"ktconvolution", AddKtConvolution},
+        {"gesummv", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench(t, "gesummv", d); }},
+        {"syrk", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench(t, "syrk", d); }},
+        {"syr2k", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench(t, "syr2k", d); }},
+        {"conv2d", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench(t, "conv2d", d); }},
+        {"conv3d", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench(t, "conv3d", d); }},
+        {"atax1", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench4(t, "atax1", d); }},
+        {"mvt2", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench4(t, "mvt2", d); }},
+        {"jacobi2d", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench4(t, "jacobi2d", d); }},
+        {"fdtd2d", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench4(t, "fdtd2d", d); }},
+        {"corrstd", [](ktt::Tuner& t, const std::string& d) { return AddPolyBench4(t, "corrstd", d); }},
+        {"atfconv", AddAtfConvolution}, {"sortreduce", AddSortReduce},
+        {"radixblocks", [](ktt::Tuner& t, const std::string& d) { return AddRadixSort(t, "radixblocks", d); }},
+        {"radixoffsets", [](ktt::Tuner& t, const std::string& d) { return AddRadixSort(t, "radixoffsets", d); }},
+        {"ludinternal", AddLudInternal}, {LaunchGapKernel, AddLaunchGap}};
     const auto kernel = kernels.find(name);
 
     if (kernel == kernels.cend())

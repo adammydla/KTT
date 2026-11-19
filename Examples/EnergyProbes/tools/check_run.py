@@ -21,6 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import counter_table  # noqa: E402
+import energy_events  # noqa: E402
 
 CLOCK_TOLERANCE_PCT = 2.0  # as ClockTolerance in Common.h
 SAME_PATH_TOLERANCE = 0.10  # probes that take the same path must agree within this
@@ -179,7 +180,8 @@ def check_measurement(rows, report, noise):
                         if short else ""), failure="WARN")
 
     # KTT ends a configuration at --max-time-ms when its power reading has not settled within --max-power-diff (runs
-    # that record it). Those rows are measured, but less precisely; on an RTX 2080 Ti 266 of 816 were.
+    # that record it). Those rows are measured, but less precisely; on an RTX 2080 Ti 266 of 816 were (107 of 242 in
+    # the lean program).
     judged = [r for r in rows if r.get("power_settled") in ("0", "1")]
     if judged:
         unsettled = [r for r in judged if r["power_settled"] == "0"]
@@ -451,10 +453,12 @@ def check_counters(counter_rows, report):
         report.check(abs(per_access - 1) <= 0.05 and (to_l15 <= 0.05 if expected else to_l15 >= 0.8),
                      f"constant probe {level}", f"{per_access:.3f} requests per warp access, {100 * to_l15:.1f} % to L1.5")
 
-    # Latency probes: every step of a chain is one coalesced line (4 sectors per L2 read request), and the lines hit their
+    # Latency probes: every step of a chain is one coalesced line (4 L2 sectors per warp access), and the lines hit their
     # level. Random lines are sometimes still in the cache above by chance: on an RTX 3090, 5-12 % of the L2 probes' loads
     # hit L1 (most with 32 working warps per SM) and 2-8 % of the DRAM probes' lines are in L2. The model counts the
-    # actual events, so this only shifts a probe's mix, but a probe with more than 15 % fails.
+    # actual events, so this only shifts a probe's mix, but a probe with more than 15 % fails. Requests and sectors are
+    # checked per warp access each, not as a ratio: CUPTI can count them in different replays of the kernel, whose L1 hits
+    # differ (RTX 2080 Ti, 2026-11-16: 0.96 requests but 4.04 sectors per access, a ratio of 4.2).
     off, checked = [], 0
     for (level, operation, width), r in rows.items():
         if not operation.startswith("chase"):
@@ -464,13 +468,58 @@ def check_counters(counter_rows, report):
         sectors = get(r, "lts__t_sectors_srcunit_tex_op_read.sum") / warp_accesses
         dram = get(r, "dram__sectors_read.sum") / warp_accesses
         checked += 1
-        if not 0.85 <= requests <= 1.02 or abs(sectors / requests - 4) > 0.2 or (dram < 0.85 * sectors if level == "DRAM"
-                                                                                  else dram > 0.05 * sectors):
+        at_level = dram >= 0.85 * sectors if level == "DRAM" else dram <= 0.05 * sectors
+        if not 0.85 <= requests <= 1.02 or not 0.85 * 4 <= sectors <= 1.02 * 4 or not at_level:
             off.append(f"{level} {operation}: {requests:.2f} requests, {sectors:.2f} L2 and {dram:.2f} DRAM sectors per "
                        "warp access")
     if checked:
         report.check(not off, "latency probes: one line per step, at their level",
                      f"{checked} rows" + ("; off: " + "; ".join(off[:4]) if off else ""))
+
+    # DRAM reads fetch what L2 asks for: at most about one DRAM sector per L2 read sector in the loads at DRAM (RTX 3090:
+    # 0.87-1.00). A GPU that fetches more (a larger L2 fetch granularity, cudaLimitMaxL2FetchGranularity, 64 B by default on
+    # the RTX 3090; NEWER_ARCHITECTURES.md section 21) moves extra DRAM sectors. The RTX 2080 Ti reads two DRAM sectors for
+    # an isolated one (2026-11-16: up to 1.98 in the probes that load one sector per line, about 1 in the streams). The
+    # model counts DRAM sectors, so it prices this, but the sub-sector probes then cost more per byte: a warning.
+    ratios = []
+    for (level, operation, width), r in rows.items():
+        if level != "DRAM" or not (operation == "ld" or operation.startswith("ld-") or operation.startswith("chase")):
+            continue
+        l2 = get(r, "lts__t_sectors_srcunit_tex_op_read.sum")
+        if l2 > 0:
+            ratios.append((f"{r['probe']} {operation} w{width}", get(r, "dram__sectors_read.sum") / l2))
+    if ratios:
+        # Below 1 is fine (some sectors of the scattered and partial loads hit L2); above 1 is over-fetch.
+        off = [f"{name}: {ratio:.2f}" for name, ratio in ratios if ratio > 1.1]
+        report.check(not off, "DRAM sectors per L2 read sector <= 1", f"{len(ratios)} loads at DRAM, "
+                     f"{min(r for _, r in ratios):.2f}-{max(r for _, r in ratios):.2f}" + ("; over-fetch (the model counts "
+                     "it): " + "; ".join(off[:4]) if off else ""), failure="WARN")
+
+    # Inline compression (Hopper and newer, opt-in per allocation) must not touch the probes' data: zero payloads
+    # would move fewer DRAM bytes. Only GPUs with the counter (GH100, GB100) can show it.
+    compressed = [get(r, "lrc__ilc_output_sectors.sum") for r in rows.values()]
+    compressed = [v for v in compressed if not math.isnan(v)]
+    if compressed:
+        report.check(max(compressed) == 0, "inline compression unused", f"lrc__ilc_output_sectors {max(compressed):.0f} at most "
+                     f"over {len(compressed)} rows")
+
+    # The IMMA probe and the optional tensor probes (--only tensor): one matrix instruction per warp step, in the event the
+    # model prices it with (DMMA in "inst fp64" on every chip, IMMA in "inst tensor imma", the others in "inst tensor").
+    off, checked = [], 0
+    for (level, operation, width), r in rows.items():
+        if level != "compute" or operation not in ("imma", "dmma", "hmma-sparse", "qmma-fp8"):
+            continue
+        counts = energy_events.events(r)
+        warp_accesses = number(r["accesses_per_launch"]) / 32
+        # IMMA has an event of its own where the run has the IMMA count; both are tensor instructions here.
+        tensor = (counts["inst tensor"] + counts["inst tensor imma"]) / warp_accesses
+        fp64 = counts["inst fp64"] / warp_accesses
+        expected = (0.0, 1.0) if operation == "dmma" else (1.0, 0.0)
+        checked += 1
+        if abs(tensor - expected[0]) > 0.05 or abs(fp64 - expected[1]) > 0.05:
+            off.append(f"{operation}: {tensor:.2f} tensor, {fp64:.2f} fp64 instructions per warp step")
+    if checked:
+        report.check(not off, "tensor probes: one instruction per step", f"{checked} rows" + ("; off: " + "; ".join(off) if off else ""))
 
 
 def main():

@@ -1,0 +1,294 @@
+{
+ "baseline": {
+  "mean_temperature_c": 67.09722222222221,
+  "mean_w": 114.79966666666667,
+  "runs": 6,
+  "slope_w_per_c": 0.2974064804166955
+ },
+ "board": {
+  "clock_policy_ms_during_run": {
+   "board-limit": 0.0,
+   "hw-power-brake": null,
+   "hw-thermal": null,
+   "reliability": 0.0,
+   "sw-power-cap": 587028.86064,
+   "sw-thermal": null
+  },
+  "ecc_enabled": null,
+  "memory_power_w": null,
+  "memory_temperature_c": null,
+  "nvlink_low_power": null,
+  "power_smoothing_enabled": null
+ },
+ "compute_capability": "8.6",
+ "cuda_context": {
+  "generic_compression_supported": true,
+  "l2_fetch_granularity_bytes": 64,
+  "l2_persisting_set_aside_bytes": 1179648
+ },
+ "device": "NVIDIA GeForce RTX 3090",
+ "fit_min_duty_pct": 25,
+ "fits": [
+  {
+   "duties": "100/25",
+   "fixed_w": -5.381616176622238,
+   "footprint_bytes": 32768,
+   "level": "L1",
+   "operation": "ld+ffma16",
+   "pj_per_access": 226.3892888514822,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -4.0409481734428,
+   "footprint_bytes": 32768,
+   "level": "L1",
+   "operation": "ld+ffma16",
+   "pj_per_access": 284.25552321947885,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.3023470599204714,
+   "footprint_bytes": 32768,
+   "level": "L1",
+   "operation": "ld+ffma4",
+   "pj_per_access": 101.05409507929518,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -0.09437403222170815,
+   "footprint_bytes": 32768,
+   "level": "L1",
+   "operation": "ld+ffma4",
+   "pj_per_access": 163.80625790868672,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -4.201465314108418,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+ffma16",
+   "pj_per_access": 343.5099925134014,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -1.0101703973545142,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+ffma16",
+   "pj_per_access": 723.9653765382463,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -3.5114411949432878,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+ffma4",
+   "pj_per_access": 231.15341980175,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -0.4281635448632173,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+ffma4",
+   "pj_per_access": 614.4442367283161,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.625466340421397,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+l1x2",
+   "pj_per_access": 297.41359913496603,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.031977701476791,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+l1x2",
+   "pj_per_access": 819.0714916210561,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.1060494000285956,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+l1x8",
+   "pj_per_access": 658.7124920453185,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -1.746574775409158,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+l1x8",
+   "pj_per_access": 1564.5203835315945,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -3.4122770926477557,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+shx2",
+   "pj_per_access": 410.4533033761638,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": 0.6484249094438894,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+shx2",
+   "pj_per_access": 815.1445347348952,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.0011263626605427,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+shx8",
+   "pj_per_access": 1052.3084862335306,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.6114685278466823,
+   "footprint_bytes": 2097152,
+   "level": "L2",
+   "operation": "ld+shx8",
+   "pj_per_access": 1415.464084624058,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": 0.21524251960357788,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+ffma16",
+   "pj_per_access": 2679.63371755743,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -1.1419973605936775,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+ffma4",
+   "pj_per_access": 765.6113980931588,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -0.4213514816750603,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+ffma4",
+   "pj_per_access": 2588.909510385724,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": 5.0874041890862145,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+l1x2",
+   "pj_per_access": 820.7169955707963,
+   "r2": null,
+   "width_bytes": 4
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -0.8818717286532944,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+l1x2",
+   "pj_per_access": 2949.9189443747737,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -0.8250089694342364,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+shx2",
+   "pj_per_access": 2984.199608944168,
+   "r2": null,
+   "width_bytes": 16
+  },
+  {
+   "duties": "100/25",
+   "fixed_w": -2.485818550215882,
+   "footprint_bytes": 268435456,
+   "level": "DRAM",
+   "operation": "ld+shx8",
+   "pj_per_access": 1653.5867432308607,
+   "r2": null,
+   "width_bytes": 4
+  }
+ ],
+ "idle": [
+  {
+   "label": "idle-noctx",
+   "memory_clock_mhz": 810.0,
+   "power_w": 41.878623036649216,
+   "sm_clock_mhz": 1200.0,
+   "temperature_c": 58.0
+  },
+  {
+   "label": "idle-start",
+   "memory_clock_mhz": 7089.361256544503,
+   "power_w": 91.00331413612552,
+   "sm_clock_mhz": 1200.0,
+   "temperature_c": 60.72251308900523
+  },
+  {
+   "label": "idle-end",
+   "memory_clock_mhz": 7498.884816753926,
+   "power_w": 104.85695287958096,
+   "sm_clock_mhz": 1200.0,
+   "temperature_c": 66.71204188481676
+  }
+ ],
+ "provenance": {
+  "cuda_driver_version": "13.0",
+  "driver_version": "580.126.09",
+  "power_limit_w": 350.0,
+  "serial": null,
+  "uuid": "GPU-7df088a1-fff4-ab84-ab61-fecb110faa53"
+ },
+ "sm_clock_mhz": 1200.0
+}

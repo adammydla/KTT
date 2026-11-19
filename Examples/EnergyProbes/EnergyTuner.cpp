@@ -16,6 +16,13 @@ void Note(std::string& note, const std::string& text)
 
 } // namespace
 
+double CounterKernelS(const CounterValues& counters)
+{
+    const auto duration = counters.find("gpu__time_duration.sum");
+    return duration != counters.cend() && duration->second > 0.0 ? duration->second * 1e-9
+        : std::numeric_limits<double>::quiet_NaN();
+}
+
 double CounterValue(const ktt::KernelProfilingCounter& counter)
 {
     switch (counter.GetType())
@@ -88,8 +95,22 @@ void EnergyTuner::TimeConfigurations(const std::string& name, const uint64_t cou
     m_Tuner.SetCompilerOptions("");
 }
 
+void EnergyTuner::TimeConfigurations(const std::string& name, const std::vector<ktt::KernelConfiguration>& configurations)
+{
+    Kernel& kernel = m_Kernels.at(name);
+    m_MeasureS = 0.0;
+    m_Tuner.SetCompilerOptions(kernel.compilerOptions);
+
+    for (const auto& configuration : configurations)
+    {
+        kernel.timed.push_back(m_Tuner.Run(kernel.kernel, configuration, {}));
+    }
+
+    m_Tuner.SetCompilerOptions("");
+}
+
 std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<std::string>& counterNames,
-    const std::string& resultPrefix)
+    const std::string& resultPrefix, const CounterPruning& pruning)
 {
     m_Tuner.SetProfiling(true);
 
@@ -99,6 +120,7 @@ std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<s
     }
 
     m_Tuner.SetProfilingCounters(counterNames);
+    const bool prune = pruning.model != nullptr && pruning.objective != EnergyObjective::Time && pruning.margin >= 0.0;
     std::vector<TunedConfiguration> rows;
 
     for (const auto& name : m_Order)
@@ -106,21 +128,22 @@ std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<s
         Kernel& kernel = m_Kernels.at(name);
         m_Tuner.SetCompilerOptions(kernel.compilerOptions);
         std::vector<ktt::KernelResult> profiled;
+        std::vector<size_t> timed; // rows with a time, profiled fastest first
 
-        for (const auto& timed : kernel.timed)
+        for (const auto& result : kernel.timed)
         {
             TunedConfiguration row;
             row.kernel = name;
-            row.kttConfiguration = timed.GetConfiguration();
+            row.kttConfiguration = result.GetConfiguration();
 
-            for (const auto& pair : timed.GetConfiguration().GetPairs())
+            for (const auto& pair : result.GetConfiguration().GetPairs())
             {
                 row.configuration += (row.configuration.empty() ? "" : " ") + pair.GetName() + "=" + pair.GetValueString();
             }
 
-            const auto& computations = timed.GetResults();
+            const auto& computations = result.GetResults();
 
-            if (!timed.IsValid() || computations.size() < 2)
+            if (!result.IsValid() || computations.size() < 2)
             {
                 Note(row.note, "run failed");
                 rows.push_back(row);
@@ -141,15 +164,69 @@ std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<s
 
             const double launches = static_cast<double>(computations.size() - 1);
             row.kernelS = ns * 1e-9 / launches;
+            row.kttKernelS = row.kernelS;
             row.temperatureC = temperature > 0.0 ? temperature / launches : std::numeric_limits<double>::quiet_NaN();
             row.smClockMHz = clock > 0.0 ? clock / launches : std::numeric_limits<double>::quiet_NaN();
+            timed.push_back(rows.size());
+            rows.push_back(row);
+        }
+
+        if (prune)
+        {
+            std::stable_sort(timed.begin(), timed.end(), [&rows](const size_t a, const size_t b)
+                { return rows[a].kttKernelS < rows[b].kttKernelS; });
+        }
+
+        // The profiled configurations' kernel time and predicted objective, for the best value so far.
+        std::vector<std::pair<double, double>> values;
+
+        for (const size_t index : timed)
+        {
+            TunedConfiguration& row = rows[index];
+
+            if (prune && !values.empty())
+            {
+                double fastest = values.front().first;
+
+                for (const auto& value : values)
+                {
+                    fastest = std::min(fastest, value.first);
+                }
+
+                double best = std::numeric_limits<double>::infinity();
+
+                for (const auto& value : values)
+                {
+                    if (std::isnan(pruning.maxSlowdown) || value.first <= fastest * (1.0 + pruning.maxSlowdown))
+                    {
+                        best = std::min(best, value.second);
+                    }
+                }
+
+                const double lowS = pruning.TimeFactor * row.kttKernelS - pruning.LaunchOverheadS;
+
+                if (lowS > 0.0 && std::isfinite(best))
+                {
+                    EnergyPrediction bound = pruning.model->Predict({}, lowS, row.temperatureC, row.smClockMHz, false, name);
+                    bound.kernelS = lowS;
+                    const double low = ObjectiveValue(bound, pruning.objective);
+
+                    if (low > best * (1.0 + pruning.margin))
+                    {
+                        Note(row.note, "not profiled: from its time alone at least "
+                            + std::to_string(static_cast<int>(100.0 * (low / best - 1.0))) + " % above the best predicted "
+                            + "value (pruned)");
+                        continue;
+                    }
+                }
+            }
 
             // One pass per Run; the last pass carries the counters.
-            ktt::KernelResult result = m_Tuner.Run(kernel.kernel, timed.GetConfiguration(), {});
+            ktt::KernelResult result = m_Tuner.Run(kernel.kernel, row.kttConfiguration, {});
 
             while (result.IsValid() && result.HasRemainingProfilingRuns())
             {
-                result = m_Tuner.Run(kernel.kernel, timed.GetConfiguration(), {});
+                result = m_Tuner.Run(kernel.kernel, row.kttConfiguration, {});
             }
 
             if (result.IsValid() && !result.GetResults().empty() && result.GetResults()[0].HasProfilingData())
@@ -159,14 +236,31 @@ std::vector<TunedConfiguration> EnergyTuner::CollectCounters(const std::vector<s
                     row.counters[counter.GetName()] = CounterValue(counter);
                 }
 
+                if (CounterKernelS(row.counters) > 0.0)
+                {
+                    row.kernelS = CounterKernelS(row.counters);
+                }
+
                 profiled.push_back(result);
+
+                if (prune)
+                {
+                    try
+                    {
+                        const EnergyPrediction p = pruning.model->Predict(row.counters, row.kernelS, row.temperatureC,
+                            row.smClockMHz, false, name);
+                        values.emplace_back(row.kernelS, ObjectiveValue(p, pruning.objective));
+                    }
+                    catch (const std::exception&)
+                    {
+                        // Not predictable: it sets no best value (the choice reports why).
+                    }
+                }
             }
             else
             {
                 Note(row.note, "no counters");
             }
-
-            rows.push_back(row);
         }
 
         if (!resultPrefix.empty())
@@ -209,7 +303,8 @@ void EnergyTuner::MeasurePower(TunedConfiguration& row, const double seconds)
         ns += static_cast<double>(computations[i].GetDuration());
     }
 
-    row.measuredS = ns * 1e-9 / static_cast<double>(computations.size() - 1);
+    row.measuredKttS = ns * 1e-9 / static_cast<double>(computations.size() - 1);
+    row.measuredS = CounterKernelS(row.counters) > 0.0 ? CounterKernelS(row.counters) : row.measuredKttS;
     row.measuredPowerW = m_Reading->powerW;
     row.measuredTemperatureC = m_Reading->temperatureC;
     row.measuredWallS = m_Launches > 0 ? m_WallS / static_cast<double>(m_Launches) : row.measuredS;
@@ -220,7 +315,8 @@ void EnergyTuner::MeasurePower(TunedConfiguration& row, const double seconds)
     if (m_Meter.baselineW)
     {
         const double baseline = m_Meter.baselineW(row.measuredTemperatureC);
-        row.measuredJ = baseline * row.measuredS + (row.measuredPowerW - baseline) * row.measuredWallS;
+        row.measuredJ = baseline * row.measuredS + (row.measuredPowerW - baseline) * row.measuredWallS
+            + m_Meter.gapBelowBaselineW * (row.measuredWallS - row.measuredS);
     }
     else
     {

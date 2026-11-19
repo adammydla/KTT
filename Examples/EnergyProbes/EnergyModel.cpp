@@ -28,7 +28,9 @@ const std::vector<std::vector<std::string>> RequiredKeys = {{"device"}, {"option
 const std::vector<std::string> DefaultOptional = {"sm__thread_inst_executed_pipe_alu_pred_on.sum",
     "sm__thread_inst_executed_pipe_fma_pred_on.sum", "sm__thread_inst_executed_pipe_fp16_pred_on.sum",
     "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum", "smsp__inst_executed_pipe_fp16.sum",
-    "smsp__inst_executed_pipe_fma_type_fp16.sum"};
+    "smsp__inst_executed_pipe_fma_type_fp16.sum", "smsp__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum",
+    "smsp__inst_executed_pipe_tensor_op_dmma.sum", "smsp__inst_executed_pipe_tensor_subpipe_dmma.sum",
+    "smsp__inst_executed_pipe_tensor_op_imma.sum"};
 
 // A counter value for a message, without trailing zeros.
 std::string ValueText(const double value)
@@ -122,6 +124,7 @@ void EnergyModel::Load(const nlohmann::json& root)
     const auto& device = root.at("device");
     m_Device = device.value("name", std::string());
     m_ClockMHz = NumberOr(device, "sm_clock_mhz", NotANumber);
+    m_FilePowerLimitW = NumberOr(device, "power_limit_w", NotANumber);
 
     // The events in the order of energy_events.py (Events()), so that sums add up in the same order as there.
     for (const auto& [name, count] : Events(CounterValues{}, 0.0))
@@ -140,6 +143,14 @@ void EnergyModel::Load(const nlohmann::json& root)
         }
 
         m_Energies.emplace_back(name, energy);
+    }
+
+    // A model file from before IMMA had an event of its own (2026-11-16) priced IMMA as "inst tensor".
+    if (!root.at("events").contains("inst tensor imma"))
+    {
+        const auto tensor = std::find_if(m_Energies.cbegin(), m_Energies.cend(), [](const auto& e) { return e.first == "inst tensor"; });
+        std::find_if(m_Energies.begin(), m_Energies.end(), [](const auto& e) { return e.first == "inst tensor imma"; })->second
+            = tensor->second;
     }
 
     for (const auto& item : root.at("events").items())
@@ -170,6 +181,15 @@ void EnergyModel::Load(const nlohmann::json& root)
 
     m_BusyScaleGbs = NumberOr(root.at("options"), "busy_scale_gbs", 95.0);
 
+    // 1 - exp(-rate / scale) needs a positive, finite scale (as energy_predictor.py).
+    const bool busyIsNumber = !root.at("options").contains("busy_scale_gbs")
+        || (root.at("options").at("busy_scale_gbs").is_number() && !root.at("options").at("busy_scale_gbs").is_boolean());
+
+    if (!busyIsNumber || !(m_BusyScaleGbs > 0.0) || !std::isfinite(m_BusyScaleGbs))
+    {
+        throw std::runtime_error(file + ": options/busy_scale_gbs must be a positive number of GB/s");
+    }
+
     const auto& baseline = root.at("baseline");
     m_BaselineW = baseline.at("mean_w").get<double>();
     m_BaselineTemperatureC = baseline.at("mean_temperature_c").get<double>();
@@ -199,6 +219,11 @@ double EnergyModel::IdlePowerW() const
     }
 
     return m_ContextIdleW;
+}
+
+double EnergyModel::BaselineSdW() const
+{
+    return std::hypot(m_BaselineSdW, m_UnknownTemperatureSdW);
 }
 
 double EnergyModel::BetweenKernelsSd() const
@@ -348,6 +373,10 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
     const double fp16 = Count(c, separateFp16 ? "smsp__inst_executed_pipe_fp16.sum" : "smsp__inst_executed_pipe_fma_type_fp16.sum");
     const double fp64 = Count(c, "smsp__inst_executed_pipe_fp64.sum");
     const double tensor = Count(c, "smsp__inst_executed_pipe_tensor.sum");
+    const double tensorHfma2 = Count(c, "smsp__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum");
+    const double tensorDmma = Count(c, "smsp__inst_executed_pipe_tensor_op_dmma.sum")
+        + Count(c, "smsp__inst_executed_pipe_tensor_subpipe_dmma.sum");
+    const double tensorImma = Count(c, "smsp__inst_executed_pipe_tensor_op_imma.sum");
     const double xu = Count(c, "smsp__inst_executed_pipe_xu.sum");
     const double lsu = Count(c, "smsp__inst_executed_pipe_lsu.sum");
     const double tex = Count(c, "smsp__inst_executed_pipe_tex.sum");
@@ -379,6 +408,10 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
         globalInst += Count(c, name);
     }
 
+    // Inactive lanes: 32 x the warp instructions minus the thread instructions (tools/energy_events.py), 0 without the
+    // thread counter.
+    const double threadInst = Value(c, "smsp__thread_inst_executed.sum");
+    const double inactive = std::isnan(threadInst) ? 0.0 : std::max(total - std::max(threadInst, 0.0) / 32.0, 0.0);
     const double dramRead = Count(c, "dram__sectors_read.sum");
     const double dramWrite = Count(c, "dram__sectors_write.sum");
     double busyNs = 0.0;
@@ -393,15 +426,17 @@ std::vector<std::pair<std::string, double>> EnergyModel::Events(const CounterVal
     return {
         {"inst alu", aluLanes},
         {"inst fma (fp32, imad)", separateFp16 ? fmaLanes : std::max(fmaLanes - fp16Lanes, 0.0)},
-        {"inst fp16", fp16Lanes},
-        {"inst fp64", fp64},
-        {"inst tensor", tensor},
+        {"inst fp16", fp16Lanes + tensorHfma2},
+        {"inst fp64", fp64 + tensorDmma},
+        {"inst tensor", std::max(tensor - tensorHfma2 - tensorDmma - tensorImma, 0.0)},
+        {"inst tensor imma", tensorImma},
         {"inst xu (mufu)", xu},
         {"inst lsu shared", sharedInst},
         {"inst lsu global", globalInst},
         {"inst lsu other", std::max(lsu - sharedInst - globalInst, 0.0)},
         {"inst tex", tex},
         {"inst other", std::max(total - alu - fma - fp64 - tensor - xu - lsu - tex - (separateFp16 ? fp16 : 0.0), 0.0)},
+        {"inst inactive lanes", inactive},
         {"L1 sector", Count(c, "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
             + Count(c, "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum")
             + Count(c, "l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum")
@@ -706,4 +741,67 @@ EnergyRecommendation EnergyModel::Recommend(const std::vector<EnergyPrediction>&
         return result.values[a] < result.values[b];
     });
     return result;
+}
+
+std::vector<size_t> ParetoFront(const std::vector<EnergyPrediction>& predictions)
+{
+    std::vector<size_t> order(predictions.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(), [&predictions](const size_t a, const size_t b)
+    {
+        return predictions[a].kernelS != predictions[b].kernelS ? predictions[a].kernelS < predictions[b].kernelS
+            : predictions[a].energyJ < predictions[b].energyJ;
+    });
+    std::vector<size_t> front;
+
+    for (const size_t i : order)
+    {
+        if (front.empty() || predictions[i].energyJ < predictions[front.back()].energyJ)
+        {
+            front.push_back(i);
+        }
+    }
+
+    return front;
+}
+
+std::vector<size_t> ParetoSteps(const EnergyModel& model, const std::vector<EnergyPrediction>& predictions,
+    const std::vector<size_t>& front, const double z)
+{
+    std::vector<size_t> steps;
+
+    for (const size_t i : front)
+    {
+        if (steps.empty() || predictions[steps.back()].energyJ - predictions[i].energyJ
+            > z * model.PairSd(predictions[i], predictions[steps.back()]))
+        {
+            steps.push_back(i);
+        }
+    }
+
+    return steps;
+}
+
+double ContenderMargin(const EnergyModel& model, const double z)
+{
+    // The baseline power in the model's accounting: the energy of one second without events.
+    const double baselineW = model.Predict({}, 1.0, NotANumber, NotANumber, false).energyJ;
+
+    if (!(baselineW > 0.0))
+    {
+        return NotANumber;
+    }
+
+    // A configuration's sd is at most (r + b) times its energy; it is a contender of the best (value v) only if
+    // v_i - v <= z sqrt(sd_i^2 + sd^2) <= c sqrt(v_i^2 + v^2), c = z (r + b). The largest such v_i / v is x with
+    // (x - 1)^2 = c^2 (x^2 + 1); a value above it is not a contender.
+    const double c = z * (model.RelativeSd() + model.BaselineSdW() / baselineW);
+
+    if (c >= 1.0)
+    {
+        return NotANumber;
+    }
+
+    const double a = 1.0 - c * c;
+    return (1.0 + std::sqrt(1.0 - a * a)) / a - 1.0;
 }

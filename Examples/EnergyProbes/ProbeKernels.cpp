@@ -93,6 +93,8 @@ std::pair<uint32_t, uint32_t> ComputeOperands(const uint64_t operation)
     case ComputeMufu: return {FloatBits(-1.0f), FloatBits(1.5f)};
     case ComputeFfma: case ComputeDfma: case ComputeDynamicIndex: case ComputeFfma3: case ComputeFfmaLoop:
         return {0u, FloatBits(-1.9f)};
+    // The opcode probes: the LCG's multiplier (I2F, POPC) and the FFMA chain's c (MUFU, F2I).
+    case ComputeOpcode: return {1664525u, FloatBits(-1.9f)};
     default: return {0u, 0u};
     }
 }
@@ -318,6 +320,16 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
         row.operation += "-" + std::to_string(words.value()) + "words";
     }
 
+    // The optional groups "mix" and "saturate": the work added to every access.
+    for (const auto& [name, tag] : {std::pair<std::string, std::string>{"MIX_FFMA", "+ffma"}, {"MIX_L1", "+l1x"},
+        {"MIX_SHARED", "+shx"}})
+    {
+        if (const auto extra = parameter(name); extra.has_value() && extra.value() > 0)
+        {
+            row.operation += tag + std::to_string(extra.value());
+        }
+    }
+
     if (const auto footprint = parameter("FOOTPRINT"))
     {
         row.footprint = footprint.value();
@@ -336,6 +348,11 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
         {
             row.operation += "-" + std::to_string(ways.value()) + "way";
         }
+
+        if (const auto group = parameter("SHARED_GROUP"))
+        {
+            row.operation += "-bcast" + std::to_string(group.value());
+        }
     }
     else if (const auto constantBytes = parameter("CONST_BYTES"))
     {
@@ -348,11 +365,21 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
     {
         row.operation = ComputeName(computeOp.value());
         row.level = "compute";
+
+        if (const auto lanes = parameter("COMPUTE_LANES"))
+        {
+            row.operation += "-lanes" + std::to_string(lanes.value());
+        }
+
+        if (const auto opcode = parameter("COMPUTE_OPCODE"))
+        {
+            row.operation += "-" + OpcodeName(opcode.value()) + (parameter("COMPUTE_CONSTANT").value_or(0) != 0 ? "-const" : "");
+        }
     }
 
     if (const auto chains = parameter("CHAINS"))
     {
-        row.operation = "chase-c" + std::to_string(chains.value()) + "-w"
+        row.operation = (parameter("ROWS").value_or(0) != 0 ? "rows-w" : "chase-c" + std::to_string(chains.value()) + "-w")
             + std::to_string(parameter("ACTIVE_WARPS").value_or(1) * parameter("BLOCKS_PER_SM").value_or(1));
     }
 
@@ -396,6 +423,17 @@ Row MakeRow(const ktt::KernelResult& result, const std::string& probe, const std
             row.fanPct = launch.trace->meanFanPct;
             row.powerSpreadPct = launch.trace->tailSpreadPct;
             row.limiters = DescribeReasons(launch.trace->reasons, true);
+
+            // NVML's cumulative clock-policy time catches limits shorter than the sampling interval, but on a locked clock
+            // a policy can be active without lowering it: "clock limited" only if the sampled clock moved too.
+            if (launch.trace->limitedMs > 0.0)
+            {
+                const double low = launch.trace->minClockMHz;
+                const double high = launch.trace->maxClockMHz;
+                const bool moved = !row.limiters.empty() || (high > 0.0 && (high - low) / high > ClockTolerance / 2.0);
+                AppendNote(row.note, (moved ? "clock limited " : "NVML clock policy active ") + Fixed(launch.trace->limitedMs, 1)
+                    + " ms (" + launch.trace->limitedBy + (moved ? ")" : "; the sampled clock did not move)"));
+            }
         }
     }
 

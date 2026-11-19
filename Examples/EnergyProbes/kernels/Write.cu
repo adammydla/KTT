@@ -29,6 +29,17 @@
 #define LOCAL_FRAME_BYTES 1024
 #define WRITE_GROUP 4
 
+// With 16-byte elements, ptxas for sm_7x and sm_10x keeps the addresses of all UNROLL accesses in registers when the groups
+// are unrolled: 76-82 registers per thread on sm_70 and sm_75 (the RTX 2080 Ti, 2026-11-16) and 68 for update on sm_100,
+// so only 2-3 of 4 blocks fit per SM and the blocks of an SM share stripes. __launch_bounds__ spills there. On those
+// architectures the group loop is not unrolled (35-46 registers; one loop branch per WRITE_GROUP accesses, which the model
+// counts). Everywhere else it is, so the SASS of the RTX 3090 (sm_86) and of sm_80, sm_89, sm_90 and sm_12x is unchanged.
+#if WIDTH == 16 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800 || (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100))
+#define WRITE_GROUPS_ROLLED 1
+#else
+#define WRITE_GROUPS_ROLLED 0
+#endif
+
 #if WRITE_OP == 2 && FOOTPRINT / (WIDTH * BLOCK_SIZE * BLOCKS_PER_SM) * WIDTH > LOCAL_FRAME_BYTES
 #error "WRITE_OP 2: FOOTPRINT / (BLOCK_SIZE x BLOCKS_PER_SM) must be at most LOCAL_FRAME_BYTES"
 #endif
@@ -138,7 +149,11 @@ extern "C" __global__ void probeWrite(Element* __restrict__ data, u32* __restric
 
     do
     {
+#if WRITE_GROUPS_ROLLED
+        #pragma unroll 1
+#else
         #pragma unroll
+#endif
         for (int g = 0; g < UNROLL / WRITE_GROUP; ++g)
         {
             u32 words[WRITE_GROUP][4];

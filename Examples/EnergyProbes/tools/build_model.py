@@ -42,7 +42,7 @@ ASSUMED_RELATIVE_SD = 0.06  # RTX 3090
 UNKNOWN_TEMPERATURE_C = 5.0
 # Calibration rows whose SM clock is further than this from the model's are left out (throttled launches: a few gemm
 # configurations ran at 1105-1170 MHz under the power cap).
-CLOCK_TOLERANCE = 0.02
+CLOCK_TOLERANCE = m.CLOCK_TOLERANCE
 
 
 def sha256(path):
@@ -138,13 +138,10 @@ def calibrate(model, prefixes, table, z=2.0):
             rows = m.load_validation(prefix, table)
         for kernel in dict.fromkeys(r["kernel"] for r in rows):
             group = [r for r in rows if r["kernel"] == kernel]
-            # Launches at another clock than the model's (throttled) are not what the model describes.
-            if not math.isnan(clock):
-                kept = [r for r in group if math.isnan(m.number(r.get("sm_clock_mhz")))
-                        or abs(m.number(r["sm_clock_mhz"]) / clock - 1) <= CLOCK_TOLERANCE]
-                off_clock += [(os.path.basename(prefix), kernel, m.number(r["sm_clock_mhz"]))
-                              for r in group if r not in kept]
-                group = kept
+            # Launches at another clock than the model's (throttled) are not what the model describes; energy_model.py
+            # scores with the same filter.
+            group, off = m.at_model_clock(group, clock)
+            off_clock += [(os.path.basename(prefix), kernel, m.number(r["sm_clock_mhz"])) for r in off]
             predictions = [model.predict(r, m.number(r["kernel_s"]), strict=False) for r in group]
             # The measured energies use the validation run's own baseline, so the comparison is on the dynamic part.
             errors = np.array([p.dynamic_j / m.number(r["dynamic_energy_j"]) - 1 for p, r in zip(predictions, group)])
@@ -251,10 +248,21 @@ def main():
     parser.add_argument("--counters", required=True, help="--profile runs of the probes, comma-separated")
     parser.add_argument("--calibration", help="--validate runs for the uncertainty, comma-separated")
     parser.add_argument("--output", required=True, help="the model file to write (e.g. rtx3090_1200mhz.model.json)")
-    parser.add_argument("--busy-scale", type=float, default=m.energy_events.BUSY_SCALE_GBS, help="as in energy_model.py")
+    parser.add_argument("--busy-scale", type=float, help="the DRAM busy event's scale in GB/s (default: the RTX 3090's "
+                        f"{m.energy_events.BUSY_SCALE_GBS:g} if this GPU's probes allow it, else their best scale; "
+                        "tools/fit_busy.py shows the scan)")
     arguments = parser.parse_args()
     power, counters = arguments.power.split(","), arguments.counters.split(",")
     calibration = arguments.calibration.split(",") if arguments.calibration else []
+
+    # The busy event's shape, and where its scale comes from (stored in the model file).
+    scan = m.busy_scale_scan(power, counters)
+    if arguments.busy_scale is None:
+        arguments.busy_scale, busy_source, _ = m.busy_scale_choice(power, counters)
+    else:
+        busy_source = "given (--busy-scale)"
+    if not (math.isfinite(arguments.busy_scale) and arguments.busy_scale > 0):
+        raise SystemExit("--busy-scale must be a positive number of GB/s")
 
     with contextlib.redirect_stdout(io.StringIO()) as notes:
         probes, table = m.probe_table(power, counters, arguments.busy_scale)
@@ -283,7 +291,9 @@ def main():
         },
         "tools": {"commit": tools_commit(), "events_sha256": sha256(os.path.join(os.path.dirname(os.path.abspath(
             __file__)), "energy_events.py"))},
-        "options": {"busy_scale_gbs": arguments.busy_scale},
+        "options": {"busy_scale_gbs": arguments.busy_scale, "busy_scale_source": busy_source,
+                    "busy_scale_scan": {"best_gbs": scan["best"], "interval_gbs": list(scan["interval"]),
+                                        "event_needed": scan["needed"]}},
         "events": {name: {"pj": float(energies[name]),
                           "status": "no probe" if name in unused else ("fitted" if energies[name] > 0 else "zero")}
                    for name in m.EVENTS},
@@ -308,6 +318,13 @@ def main():
                     "counters": [source(p, ".csv") for p in counters],
                     "calibration": [source(p, "_validation.csv") for p in calibration]},
     }
+    # IMMA without a probe of its own (a GPU before sm_80, such as Turing with its m8n8k16 IMMA, or a counter run without
+    # the IMMA count): priced as an HMMA warp instruction, as before IMMA had an event of its own, rather than as free.
+    imma, tensor = data["events"]["inst tensor imma"], data["events"]["inst tensor"]
+    if imma["status"] == "no probe" and tensor["status"] == "fitted":
+        data["events"]["inst tensor imma"] = {"pj": tensor["pj"], "status": "as inst tensor"}
+        unused = set(unused) - {"inst tensor imma"}
+        notes.write("inst tensor imma: no IMMA probe in these runs, priced as inst tensor\n")
     data["uncertainty"] = {"dynamic_relative_sd": ASSUMED_RELATIVE_SD, "dynamic_bias": None, "calibration": None,
                            "assumed": True, "baseline_sd_w": baseline_scatter(power),
                            "baseline_unknown_temperature_sd_w": UNKNOWN_TEMPERATURE_C * data["baseline"]["slope_w_per_c"]}
@@ -318,6 +335,7 @@ def main():
           f"{100 * data['fit']['median_abs_error']:.1f} %, {data['fit']['within_10_pct']} probes within 10 %")
     for line in notes.getvalue().splitlines():
         print("  " + line)
+    print(f"  {m.describe_busy_scan(scan)}; the model uses {arguments.busy_scale:g} GB/s: {busy_source}")
     if unused:
         print("  no probe prices: " + ", ".join(sorted(unused)))
     if calibration:

@@ -35,8 +35,11 @@ struct Options
     std::vector<std::string> validate; // --validate: KTT example kernels to measure instead of the probes
     uint64_t validateConfigs = 24;     // random configurations per kernel
     uint64_t validateMs = 4000;        // measurement time per configuration
+    std::string validateData = "example"; // --validate-data: the kernels' input data (example, zeros, random)
     std::vector<std::string> tune;     // --tune: example kernels to tune with the energy model
     std::string modelFile;             // --model-file: the model for --tune and --predict (tools/build_model.py)
+    bool allowUncalibratedDevice = false; // --tune with a model of another GPU type (--allow-uncalibrated-device)
+    std::string recountCsv;            // --recount: a --validate run's CSV whose configurations are counted again
     std::string predictCsv;            // --predict: a --validate run's CSV to predict without a GPU
     std::string analyzePrefix;         // --analyze: analyse the CSV of an earlier run instead of measuring
     bool dryRun = false;
@@ -46,11 +49,14 @@ struct Options
     std::optional<double> maxSlowdownPct;       // only configurations at most this much slower than the fastest
     std::optional<double> maxEnergyIncreasePct; // only those at most this much above the lowest energy
     std::string accounting = "awake";           // awake, above-idle or dynamic (which baseline the energy includes)
+    std::optional<double> powerLimitW;          // --predict, --tune: the power limit (0 = none)
     std::optional<double> idleW;                // the idle power for above-idle (default: the model file's)
+    bool prune = true;                          // --tune: leave out configurations that cannot be the choice
     double contenderSd = 2.0;                   // configurations within this many sd of the best are contenders
     std::string tuneMeasure = "none";           // none, contenders or all (NVML power of the candidates)
     std::optional<uint64_t> tuneScaleConfigs;   // default: 5 with more than one kernel, else 0
     double measureMarginPct = 1.0;              // measured candidates this close to the best are not told apart
+    uint64_t measureMax = 0;                    // --tune-measure contenders: at most this many, best predicted first (0 = all)
     bool lenient = false;                       // counters the model needs and does not find become warnings
 
     // The measurement.
@@ -68,6 +74,8 @@ struct Options
     bool monitor = true;
     std::optional<uint32_t> lockClockMHz;
     bool clockLockedExternally = false; // locked with nvidia-smi -lgc by someone else
+    double expectedSmClockMHz = std::numeric_limits<double>::quiet_NaN();     // --expect-clock (or --lock-clock)
+    double expectedMemoryClockMHz = std::numeric_limits<double>::quiet_NaN(); // --expect-clock SM:MEM
 
     // The shape of the probes.
     uint64_t blockSize = 256;

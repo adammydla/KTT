@@ -151,9 +151,24 @@ const std::vector<OptionSpec>& OptionSpecs()
         {"--clock-locked", "", "the SM clock is already locked (sudo nvidia-smi -i <gpu> -lgc F,F): rows at another\n"
             "clock than the baseline's are withheld",
             [](Options& o, const std::string&) { o.clockLockedExternally = true; }},
+        {"--expect-clock", "SM[:MEM]", "the SM (and memory) clock in MHz the GPU should run at, as set with nvidia-smi\n"
+            "-lgc/-lmc or -ac: after the warm-up the program compares them with the clocks NVML reports under\n"
+            "load and warns if one is off by more than a clock step (--lock-clock sets the expected SM clock)",
+            [](Options& o, const std::string& v)
+            {
+                const auto colon = v.find(':');
+                o.expectedSmClockMHz = static_cast<double>(Number(v.substr(0, colon), "--expect-clock"));
 
-        {"--only", "LIST", "probe groups to run (default all): global, compute, shared, latency, banks, constant,\n"
-            "locality, sub-sector, write-path, misaligned, writes",
+                if (colon != std::string::npos)
+                {
+                    o.expectedMemoryClockMHz = static_cast<double>(Number(v.substr(colon + 1), "--expect-clock"));
+                }
+            }},
+
+        {"--only", "LIST", "probe groups to run (default all but tensor): global, compute, shared, latency, banks,\n"
+            "constant, locality, sub-sector, write-path, misaligned, writes; tensor (optional, not part of\n"
+            "the calibration): DMMA, sparse HMMA and FP8 mma.sync, checks of the tensor price; the other\n"
+            "optional groups (checks): lanes, opcodes, broadcast, reuse, mix, saturate",
             [](Options& o, const std::string& v) { o.only = NameList(v, "--only", ProbeGroupNames()); }},
         {"--profile", "", "the counter run: CUPTI counters of every probe, at duty 100 with short windows (--duty 100\n"
             "--min-time-ms 500 --max-time-ms 1000 --warmup-s 10 --idle-s 0); the counts are a property of\n"
@@ -181,10 +196,19 @@ const std::vector<OptionSpec>& OptionSpecs()
         {"--validate", "LIST", "instead of the probes, measure random configurations of KTT example kernels: power and\n"
             "time, then CUPTI counters (for the model's uncertainty, tools/build_model.py --calibration).\n"
             "all = transpose, gemm, nbody, coulomb; heldout = reduction, convolution, pnpoly; heldout2 =\n"
-            "bicg, ktconvolution",
+            "bicg, ktconvolution (these nine calibrate the uncertainty); heldout3 = gesummv, syrk, syr2k, conv2d,\n"
+            "conv3d (PolyBench, the first frozen evaluation, reused since 2026-11-17); heldout4 = atax1, mvt2,\n"
+            "jacobi2d, fdtd2d, corrstd (PolyBench, the frozen evaluation since 2026-11-17); heldout5 = atfconv,\n"
+            "sortreduce, radixblocks, radixoffsets (the AtfSamples, Sort and Sort2 examples, frozen 2026-11-17; none of\n"
+            "heldout3-5 is for --calibration); diagnose = ludinternal (Rodinia's lud_internal and parts of it)",
             [](Options& o, const std::string& v) { o.validate = KernelList(v, "--validate"); }},
         {"--validate-configs", "N", "--validate, --tune: configurations per kernel (default 24)",
             [](Options& o, const std::string& v) { o.validateConfigs = Number(v, "--validate-configs"); }},
+        {"--validate-data", "MODE", "--validate: the input data of the kernels: example (default, as each kernel writes it),\n"
+            "zeros, or random (uniform floats in [0, 1) or random 32-bit keys); zeros and random only for the\n"
+            "kernels that support them (transpose, reduction, atfconv, sortreduce, radixblocks, radixoffsets),\n"
+            "to check whether data values move power",
+            [](Options& o, const std::string& v) { o.validateData = v; }},
         {"--validate-ms", "N", "--validate, --tune-measure: power measurement per configuration (default 4000)",
             [](Options& o, const std::string& v) { o.validateMs = Number(v, "--validate-ms"); }},
         {"--tune", "LIST", "instead of the probes, tune example kernels (names as for --validate) with the energy\n"
@@ -193,8 +217,14 @@ const std::vector<OptionSpec>& OptionSpecs()
             [](Options& o, const std::string& v) { o.tune = KernelList(v, "--tune"); }},
         {"--predict", "FILE", "the same choice from a --validate run's CSV (PREFIX_validation.csv), without a GPU",
             [](Options& o, const std::string& v) { o.predictCsv = v; }},
+        {"--recount", "FILE", "instead of the probes, the counter pass again over the configurations of a --validate run\n"
+            "(FILE: its PREFIX_validation.csv), no power; writes PREFIX_recount.csv (tools/merge_counters.py)",
+            [](Options& o, const std::string& v) { o.recountCsv = v; }},
         {"--model-file", "FILE", "the energy model for --tune and --predict (tools/build_model.py writes it)",
             [](Options& o, const std::string& v) { o.modelFile = v; }},
+        {"--allow-uncalibrated-device", "", "let --tune use a model calibrated on another GPU type (default: refused;\n"
+            "the energies need this GPU's own probes, check_model.py says whether a model fits)",
+            [](Options& o, const std::string&) { o.allowUncalibratedDevice = true; }},
         {"--objective", "NAME", "what --tune and --predict minimise: energy (default), edp, ed2p or time",
             [](Options& o, const std::string& v) { o.objective = Choice(v, "--objective", {"energy", "edp", "ed2p", "time"}); }},
         {"--max-slowdown", "PCT", "only configurations at most PCT % slower than the fastest",
@@ -202,6 +232,9 @@ const std::vector<OptionSpec>& OptionSpecs()
         {"--max-energy-increase", "PCT", "only configurations at most PCT % above the lowest predicted energy (with\n"
             "--objective time: the fastest of the nearly cheapest)",
             [](Options& o, const std::string& v) { o.maxEnergyIncreasePct = Fraction(v, "--max-energy-increase"); }},
+        {"--power-limit", "W", "--tune, --predict: the GPU's power limit; a configuration predicted above it gets the limit\n"
+            "times its time (default: NVML's limit with --tune, the model file's with --predict; 0 = none)",
+            [](Options& o, const std::string& v) { o.powerLimitW = Fraction(v, "--power-limit"); }},
         {"--accounting", "NAME", "which baseline the energy includes: awake (default; kernels back to back), above-idle\n"
             "(the GPU idles with a CUDA context between runs of the work) or dynamic (no baseline)",
             [](Options& o, const std::string& v)
@@ -212,12 +245,19 @@ const std::vector<OptionSpec>& OptionSpecs()
             [](Options& o, const std::string& v) { o.idleW = Fraction(v, "--idle-w"); }},
         {"--contender-sd", "X", "configurations within X standard deviations of the best are contenders (default 2)",
             [](Options& o, const std::string& v) { o.contenderSd = Fraction(v, "--contender-sd"); }},
+        {"--no-prune", "", "--tune: profile every configuration (default: one predicted from its time alone to be\n"
+            "above the best by more than the model's error is not profiled; see CounterPruning in EnergyTuner.h)",
+            [](Options& o, const std::string&) { o.prune = false; }},
         {"--tune-measure", "WHAT", "--tune: after the model's choice, measure the power of its contenders (and of the\n"
             "fastest configuration) or of all configurations, and take the measured best; default none",
             [](Options& o, const std::string& v) { o.tuneMeasure = Choice(v, "--tune-measure", {"none", "contenders", "all"}); }},
         {"--measure-margin", "PCT", "--tune-measure: measurements within PCT % of the lowest are not told apart; among\n"
             "them the model's choice, else the fastest (default 1)",
             [](Options& o, const std::string& v) { o.measureMarginPct = Fraction(v, "--measure-margin"); }},
+        {"--measure-max", "N", "--tune-measure contenders: measure the choice and at most N - 1 of its contenders, the\n"
+            "best predicted first (default 0: all of them). On the random sweep of 2026-11-18 the measured best was\n"
+            "among the model's 5 best in 7 of 8 kernels and among its 10 best in all 8",
+            [](Options& o, const std::string& v) { o.measureMax = Number(v, "--measure-max"); }},
         {"--tune-scale-configs", "N", "--tune-measure: also measure N configurations spread over each kernel's predicted\n"
             "energy and take the kernel's scale from them (default 5 with more than one kernel, else 0)",
             [](Options& o, const std::string& v) { o.tuneScaleConfigs = Number(v, "--tune-scale-configs"); }},
@@ -317,6 +357,14 @@ void Check(Options& options)
         "--tune and --predict need --model-file");
     require(options.tune.empty() || options.predictCsv.empty(), "--tune and --predict exclude each other");
     require(!options.idleW.has_value() || options.accounting == "above-idle", "--idle-w goes with --accounting above-idle");
+    const auto has = [&options](const std::string& k)
+        { return std::find(options.validate.cbegin(), options.validate.cend(), k) != options.validate.cend(); };
+    require(!has("reduction") || !has("sortreduce"), "--validate: reduction and sortreduce cannot run together (both "
+        "examples name their kernel reduce, and KTT keeps one definition per name)");
+    require(options.validateData == "example" || options.validateData == "zeros" || options.validateData == "random",
+        "--validate-data must be example, zeros or random");
+    require(options.validateData == "example" || std::all_of(options.validate.cbegin(), options.validate.cend(),
+        [](const std::string& k) { return SupportsDataMode(k); }), "--validate-data zeros or random: a kernel of --validate does not support it");
     require(!options.profile || options.validate.empty(), "--validate collects counters in a pass of its own, remove --profile");
     require(!options.lockClockMHz.has_value() || options.monitor, "--lock-clock needs the NVML monitor, remove --no-monitor");
 

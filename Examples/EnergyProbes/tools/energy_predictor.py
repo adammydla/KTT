@@ -78,12 +78,17 @@ REQUIRED_KEYS = (("device",), ("options",), ("events",), ("baseline", "mean_w"),
                  ("baseline", "slope_w_per_c"), ("uncertainty", "dynamic_relative_sd"), ("counters", "required"),
                  ("counters", "lsu_shared"), ("counters", "lsu_global"), ("counters", "aliases"))
 
-# Optional counters the events use when a GPU has them (lane counts, the fp16 pipe of Turing and GA100); the same names
+# Optional counters the events use when a GPU has them (lane counts, the fp16 pipe of Turing and GA100, the tensor pipe's
+# non-matrix instructions); the same names
 # as EnergyModel.cpp, for model files that do not list them.
 OPTIONAL_COUNTERS = ("sm__thread_inst_executed_pipe_alu_pred_on.sum", "sm__thread_inst_executed_pipe_fma_pred_on.sum",
                      "sm__thread_inst_executed_pipe_fp16_pred_on.sum",
                      "sm__thread_inst_executed_pipe_fma_type_fp16_pred_on.sum", "smsp__inst_executed_pipe_fp16.sum",
-                     "smsp__inst_executed_pipe_fma_type_fp16.sum")
+                     "smsp__inst_executed_pipe_fma_type_fp16.sum",
+                     # The tensor pipe's HFMA2.MMA and DMMA (GA100, GH100, GB100), priced as fp16 and fp64.
+                     "smsp__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum",
+                     "smsp__inst_executed_pipe_tensor_op_dmma.sum", "smsp__inst_executed_pipe_tensor_subpipe_dmma.sum",
+                     "smsp__inst_executed_pipe_tensor_op_imma.sum")
 
 
 class ModelError(Exception):
@@ -127,7 +132,14 @@ class Model:
         self.path = path
         self.device = data["device"]
         self.options = data["options"]
+        # The busy event's scale: 1 - exp(-rate / scale) needs a positive, finite scale (as EnergyModel.cpp).
+        busy_scale = self.options.get("busy_scale_gbs", energy_events.BUSY_SCALE_GBS)
+        if isinstance(busy_scale, bool) or not isinstance(busy_scale, (int, float)) or not 0 < busy_scale < math.inf:
+            raise ModelError(f"{name}: options/busy_scale_gbs must be a positive number of GB/s, not {busy_scale!r}")
         self.pj = {event: float(entry["pj"]) for event, entry in data["events"].items()}
+        # A model file from before IMMA had an event of its own (2026-11-16) priced IMMA as "inst tensor".
+        if "inst tensor imma" not in self.pj and "inst tensor" in self.pj:
+            self.pj["inst tensor imma"] = self.pj["inst tensor"]
         unknown = sorted(set(self.pj) - set(energy_events.EVENTS))
         if unknown:
             raise ModelError(f"{name}: events this tool does not know: {', '.join(unknown)}")
@@ -369,10 +381,16 @@ def objective_value(prediction, objective):
     raise ValueError(f"objective must be one of {', '.join(OBJECTIVES)}")
 
 
+def file_power_limit(model):
+    """The power limit NVML reported on the calibration GPU (the model file's device), None if the file has none."""
+    value = model.device.get("power_limit_w")
+    return float(value) if value else None
+
+
 def pareto_front(predictions):
     """Indices of the configurations that no other one beats in both time and predicted energy, by time. Over all
     the configurations given, also those that a limit (--max-slowdown, --max-energy-increase) excludes from the choice:
-    the front shows the trade-off itself (Python only)."""
+    the front shows the trade-off itself (EnergyModel.cpp ParetoFront)."""
     order = sorted(range(len(predictions)), key=lambda i: (predictions[i].kernel_s, predictions[i].energy_j))
     front, best = [], math.inf
     for i in order:
@@ -380,6 +398,64 @@ def pareto_front(predictions):
             front.append(i)
             best = predictions[i].energy_j
     return front
+
+
+def pareto_steps(model, predictions, front, z=2.0):
+    """The points of the front the model tells apart: from the fastest, each next one saves more than z standard
+    deviations (model.pair_sd) of energy against the last one kept (EnergyModel.cpp ParetoSteps)."""
+    steps = []
+    for i in front:
+        if not steps or predictions[steps[-1]].energy_j - predictions[i].energy_j > \
+                z * model.pair_sd(predictions[i], predictions[steps[-1]]):
+            steps.append(i)
+    return steps
+
+
+# The kernel's own time against KTT's time of a launch (EnergyTuner.h CounterPruning): at least
+# PRUNE_TIME_FACTOR x KTT's time - PRUNE_LAUNCH_OVERHEAD_S.
+PRUNE_TIME_FACTOR = 0.85
+PRUNE_LAUNCH_OVERHEAD_S = 1.5e-3
+
+
+def contender_margin(model, z=2.0):
+    """How far (relative) above the best objective value a configuration's value must be predicted to be neither the
+    choice nor a contender of recommend() at z within one kernel (EnergyModel.cpp ContenderMargin); None when the
+    accounting has no baseline."""
+    baseline_w = model.predict({}, 1.0, strict=False).energy_j
+    if not baseline_w > 0:
+        return None
+    baseline_sd = math.hypot(float(model.uncertainty.get("baseline_sd_w", 0.0)),
+                             float(model.uncertainty.get("baseline_unknown_temperature_sd_w", 0.0)))
+    c = z * (float(model.uncertainty["dynamic_relative_sd"]) + baseline_sd / baseline_w)
+    if c >= 1:
+        return None
+    a = 1 - c * c
+    return (1 + math.sqrt(1 - a * a)) / a - 1
+
+
+def pruned_indices(model, ktt_s, temperatures, value_of, objective="energy", z=2.0, max_slowdown=None):
+    """The configurations the counter pass of --tune leaves out (EnergyTuner.cpp CollectCounters): in the order of KTT's
+    time, one whose objective is, from its time alone, above the best predicted value so far by more than
+    contender_margin(). ktt_s, temperatures: per configuration; value_of(i): (kernel time, predicted objective) of a
+    profiled configuration i. For checking the rule offline on runs that profiled everything."""
+    margin = contender_margin(model, z)
+    if objective == "time" or margin is None:
+        return set()
+    skipped, values = set(), []
+    for i in sorted(range(len(ktt_s)), key=lambda i: ktt_s[i]):
+        if values:
+            fastest = min(t for t, _ in values)
+            best = min((v for t, v in values if max_slowdown is None or t <= fastest * (1 + max_slowdown)),
+                       default=math.inf)
+            low_s = PRUNE_TIME_FACTOR * ktt_s[i] - PRUNE_LAUNCH_OVERHEAD_S
+            if low_s > 0 and math.isfinite(best):
+                bound = model.predict({}, low_s, temperatures[i], strict=False)
+                low = objective_value(bound, objective)
+                if low > best * (1 + margin):
+                    skipped.add(i)
+                    continue
+        values.append(value_of(i))
+    return skipped
 
 
 def admissible_indices(predictions, max_slowdown=None, max_energy_increase=None):
@@ -503,7 +579,7 @@ def main():
     parser.add_argument("--z", type=float, default=2.0, help="standard deviations within which configurations are "
                         "contenders (default 2)")
     parser.add_argument("--power-limit", type=float, help="the GPU's power limit in W (nvidia-smi shows it): configurations "
-                        "predicted above it get the limit times their time")
+                        "predicted above it get the limit times their time (default: the model file's, 0 = none)")
     parser.add_argument("--accounting", choices=ACCOUNTINGS, default="awake", help="which baseline goes into the energy: "
                         "awake (default; kernels back to back), above-idle (the GPU idles with a context between runs of "
                         "the work) or dynamic (none)")
@@ -512,20 +588,27 @@ def main():
     parser.add_argument("--lenient", action="store_true", help="missing counters and bad counter values become warnings "
                         "instead of an error")
     parser.add_argument("--all", action="store_true", help="print every configuration, not only the choice")
+    parser.add_argument("--allow-uncalibrated-device", action="store_true", help="use the model although the KTT output "
+                        "names another GPU than the model's (default: refused, as --tune of the program)")
     arguments = parser.parse_args()
 
     try:
         model = Model.load(arguments.model)
-        model.power_limit_w = arguments.power_limit
+        model.power_limit_w = file_power_limit(model) if arguments.power_limit is None else (arguments.power_limit or None)
         model.accounting = arguments.accounting
         model.idle_w = arguments.idle_w
         kernels = from_ktt_json(arguments.ktt) if arguments.ktt else from_validation_csv(arguments.csv)
         device = ktt_device(arguments.ktt) if arguments.ktt else None
+        if device and model.device.get("name") and device != model.device["name"] \
+                and not arguments.allow_uncalibrated_device:
+            raise ModelError(f"the model was calibrated on {model.device['name']}, the KTT output is from {device}: calibrate "
+                             "that GPU, or pass --allow-uncalibrated-device to use the model anyway")
         if not kernels:
             raise ModelError("no configuration with counters and a duration in the input")
         print(f"Model: {model.device.get('name')} at {model.device.get('sm_clock_mhz')} MHz, "
               f"{sum(1 for v in model.pj.values() if v > 0)} priced events, relative sd of the dynamic energy "
-              f"{100 * float(model.uncertainty['dynamic_relative_sd']):.1f} %, accounting {model.accounting}"
+              f"{100 * float(model.uncertainty['dynamic_relative_sd']):.1f} %, power limit "
+              f"{f'{model.power_limit_w:.0f} W' if model.power_limit_w else 'none'}, accounting {model.accounting}"
               + (f" (idle {model.idle_power_w():.1f} W)" if model.accounting == "above-idle" else ""))
         for kernel, configurations in kernels.items():
             predictions = [model.predict(counters, seconds, temperature, clock, label, strict=not arguments.lenient,
@@ -557,7 +640,19 @@ def main():
             if fastest is not best:
                 print(f"  against the fastest configuration: {100 * (best.energy_j / fastest.energy_j - 1):+.1f} % energy, "
                       f"{100 * (best.kernel_s / fastest.kernel_s - 1):+.1f} % time")
-            print(f"  energy-time Pareto front: {len(choice.front)} configuration(s)")
+            steps = pareto_steps(model, predictions, choice.front, arguments.z)
+            print(f"  energy-time trade-off: {len(choice.front)} configuration(s) on the Pareto front, {len(steps)} told "
+                  f"apart (each saves more than {arguments.z:g} sd of energy\n  against the next faster one):")
+            print(f"    {'t [ms]':>10}{'E [J]':>12}{'+- sd':>10}{'time':>9}{'energy':>9}  configuration")
+            first = predictions[choice.front[0]]
+            for i in choice.front:
+                if i not in steps and i != choice.index:
+                    continue
+                p = predictions[i]
+                print(f"    {1e3 * p.kernel_s:10.4g}{p.energy_j:12.4g}{p.sd_j:10.2g}"
+                      f"{100 * (p.kernel_s / first.kernel_s - 1):8.1f}%{100 * (p.energy_j / first.energy_j - 1):8.1f}%  "
+                      f"{p.label}" + ("  [use]" if i == choice.index else "")
+                      + ("" if i in steps else "  [not told apart from a faster one]"))
             off_clock = sum(any("SM clock" in w for w in p.warnings) for p in predictions)
             if 2 * off_clock > len(predictions):
                 print(f"  NOTICE: {off_clock} of {len(predictions)} configurations ran at another SM clock than the model's. "

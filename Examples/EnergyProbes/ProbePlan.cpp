@@ -9,9 +9,52 @@
 
 const std::vector<std::string>& ProbeGroupNames()
 {
-    static const std::vector<std::string> names = {"global", "compute", "shared", "latency", "banks", "constant",
-        "locality", "sub-sector", "write-path", "misaligned", "writes"};
+    static const std::vector<std::string> names = {"global", "compute", "lanes", "shared", "latency", "rows", "banks",
+        "constant", "locality", "sub-sector", "write-path", "misaligned", "writes", "tensor", "opcodes",
+        "broadcast", "reuse", "mix", "saturate"};
     return names;
+}
+
+uint64_t GridWalkPerSm(const uint64_t footprint, const uint64_t multiprocessors, const uint64_t blocksPerSm,
+    const uint64_t sectorsPerBlock)
+{
+    const uint64_t sectors = footprint / SectorBytes;
+    const uint64_t blocks = multiprocessors * blocksPerSm;
+
+    if (sectors == 0 || blocks == 0 || sectorsPerBlock == 0)
+    {
+        return footprint;
+    }
+
+    // A thread's counter c0 + k x step (step: the grid's counters), masked to the footprint's sectors, stays in the class
+    // c0 modulo g = gcd(step, sectors); a block's counters start next to each other, so it covers the classes of
+    // sectorsPerBlock consecutive counters, a block of g / sectorsPerBlock "chunks". The SM's blocks b, b + SMs, ... start
+    // in chunk classes b + i x SMs modulo g / sectorsPerBlock; each distinct class is footprint x sectorsPerBlock / g bytes.
+    const uint64_t g = std::gcd(blocks * sectorsPerBlock, sectors);
+    const uint64_t classes = std::max<uint64_t>(g / sectorsPerBlock, 1);
+    std::set<uint64_t> distinct;
+
+    for (uint64_t i = 0; i < blocksPerSm; ++i)
+    {
+        distinct.insert(i * multiprocessors % classes);
+    }
+
+    return std::min(footprint, distinct.size() * (footprint / classes));
+}
+
+bool GridWalkReachesL2(const Options& options, const Hardware& hardware, const Footprints& footprints)
+{
+    const uint64_t needed = 4 * hardware.l1Size.value_or(4 * footprints.l1);
+    // Counters per block: probeScatter (16-byte elements, 2 threads per sector) and probePartial (one sector per thread).
+    for (const uint64_t perBlock : {options.blockSize * DefaultWidth / SectorBytes, options.blockSize})
+    {
+        if (GridWalkPerSm(footprints.l2, hardware.multiprocessors, options.blocksPerSm, perBlock) < needed)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // The probe set is what the model's scores need, and no more (README, "Which probes run"): of the bank-conflict,
@@ -60,11 +103,37 @@ std::vector<ProbeGroup> ProbeGroups(const Options& options, const Hardware& hard
     std::vector<uint64_t> compute = {ComputeLoop, ComputeFfma, ComputeDfma, ComputeImad, ComputeHfma2, ComputeMufu,
         ComputeFfma3, ComputeShfl, ComputeBar, ComputeFfmaLoop, ComputeDynamicIndex};
 
-    // HMMA in the shape the GPU has (kernels/Compute.cu): m8n8k4 on sm_70, m16n8k8 on sm_75, m16n8k16 from sm_80.
+    // HMMA in the shape the GPU has (kernels/Compute.cu): m8n8k4 on sm_70, m16n8k8 on sm_75, m16n8k16 from sm_80. IMMA
+    // (s8 m16n8k32, sm_80+) prices "inst tensor imma" since 2026-11-16: 36 % above HMMA per warp instruction on an RTX 3090.
     if (hardware.computeCapabilityMajor >= 7 || hardware.computeCapabilityMajor == 0)
     {
         compute.push_back(ComputeHmma);
     }
+
+    if (hardware.computeCapabilityMajor >= 8 || hardware.computeCapabilityMajor == 0)
+    {
+        compute.push_back(ComputeImma);
+    }
+
+    // The other tensor-core paths (NEWER_ARCHITECTURES.md items 7 and 13): an optional group, not in the calibration run,
+    // whose probes energy_model.py reports as checks of the "inst tensor" price. FP8 mma.sync is native only on sm_89
+    // and sm_120 (ptxas emulates it with conversions and HMMA on sm_90 and sm_100), so it is planned on those exactly.
+    const uint32_t major = hardware.computeCapabilityMajor;
+    const uint32_t minor = hardware.computeCapabilityMinor;
+    std::vector<uint64_t> tensor;
+
+    if (major >= 8 || major == 0)
+    {
+        tensor = {ComputeDmma, ComputeHmmaSparse};
+    }
+
+    if ((major == 8 && minor == 9) || major == 12 || major == 0)
+    {
+        tensor.push_back(ComputeQmmaFp8);
+    }
+
+    std::vector<uint64_t> opcodes(OpcodeCount);
+    std::iota(opcodes.begin(), opcodes.end(), uint64_t{1});
 
     const std::vector<ProbeGroup> all = {
         {"global", "global", ProbeKernel::Global,
@@ -73,13 +142,22 @@ std::vector<ProbeGroup> ProbeGroups(const Options& options, const Hardware& hard
             in(global), options.duties, true,
             "ld of 4, 8, 16 B at L1, L2, DRAM; the no-load loop; st of 4, 16 B and 32-bit red, atom at L2, DRAM"},
         {"compute", "compute", ProbeKernel::Compute, {{"COMPUTE_OP", compute}}, {}, options.duties, false,
-            "the empty loop, FFMA (x * x + c and three registers), DFMA, IMAD, HFMA2, HMMA, MUFU, shuffle, barrier, the "
+            "the empty loop, FFMA (x * x + c and three registers), DFMA, IMAD, HFMA2, HMMA, IMMA, MUFU, shuffle, barrier, the "
             "FFMA loop with branches, FFMA accumulators with a runtime index"},
+        {"lanes", "compute", ProbeKernel::Compute, {{"COMPUTE_OP", {ComputeFfma, ComputeImad}}, {"COMPUTE_LANES", {1, 8}}},
+            {}, options.duties, false,
+            "optional (--only lanes): FFMA and IMAD in 1 or 8 lanes of every warp, the others branching around them "
+            "(partly idle warps); checks, not in the fit", true},
         {"shared", "shared", ProbeKernel::Shared, {shared, {"SHARED_OP", {SharedLoad, SharedStore, SharedRed}}}, {},
             options.duties, false, "conflict-free ld.shared, st.shared (16 B) and red.shared"},
         {"latency", "latency", ProbeKernel::Latency,
-            {{"FOOTPRINT", {l2, dram}}, {"WIDTH", {4}}, {"CHAINS", {1, 16}}, {"ACTIVE_WARPS", {1, 8}}}, {}, fullRate, false,
-            "chains of dependent 4-byte loads at L2, DRAM: 1 or 16 chains per warp, 1 or 8 working warps per block"},
+            {{"FOOTPRINT", {l2, dram}}, {"WIDTH", {4}}, {"CHAINS", {1, 4, 16}}, {"ACTIVE_WARPS", {1, 2, 4, 8}}}, {}, fullRate,
+            false, "chains of dependent 4-byte loads at L2, DRAM: 1, 4 or 16 chains per warp, 1, 2, 4 or 8 working warps per "
+            "block (steady traffic from about 100 to 900 GB/s at DRAM, which pins the DRAM busy event's shape)"},
+        {"rows", "rows", ProbeKernel::Latency,
+            {{"FOOTPRINT", {dram}}, {"WIDTH", {4}}, {"CHAINS", {1}}, {"ROWS", {1}}, {"ACTIVE_WARPS", {1, 2, 4, 8}}}, {}, fullRate,
+            false, "every thread walking a row of its own (4-byte words, one thread per matrix row) at DRAM, 1, 2, 4 or 8 "
+            "working warps per block"},
         {"banks", "banks", ProbeKernel::Banks,
             {shared, {"SHARED_OP", {SharedLoad, SharedStore}}, {"SHARED_WIDTH", {4, 16}}, {"BANK_WAYS", {1, 8}}},
             [](Values v) { return v[2] * v[3] <= WavefrontBytes; }, options.duties, false,
@@ -113,13 +191,61 @@ std::vector<ProbeGroup> ProbeGroups(const Options& options, const Hardware& hard
             options.duties, true,
             "loads and stores together, 4 and 16 B: copy and update in place at L2, DRAM; local memory at L1 and with the "
             "whole frame of every thread"},
+        {"opcodes", "compute", ProbeKernel::Compute,
+            {{"COMPUTE_OP", {ComputeOpcode}}, {"COMPUTE_OPCODE", opcodes}, {"COMPUTE_CONSTANT", {0, 1}}},
+            [](Values v) { return v[2] == 0 || v[1] <= OpcodeLastWithConstant; }, options.duties, false,
+            "optional (--only opcodes): single SASS opcodes within their pipes (FADD, FMUL, FFMA and DADD, DMUL, DFMA with "
+            "three registers, IADD3, LOP3, SHF, MUFU EX2/LG2/SIN/RCP/SQRT/TANH, I2F, F2I, POPC, F2F to double and back), the first seven also with "
+            "almost constant operands; checks for tools/opcode_energy.py, not in the fit", true},
+        {"reuse", "compute", ProbeKernel::Compute,
+            {{"COMPUTE_OP", {ComputeOpcode}}, {"COMPUTE_OPCODE", {3, OpcodeReuseFirst, OpcodeReuseFirst + 1, OpcodeReuseLast}}},
+            {}, options.duties, false,
+            "optional (--only reuse): FFMA x = x * m + o with three registers (opcode 3, as in the opcodes group) and with "
+            "the same m and o in all chains from 0, 1 or 2 shared registers (the operand reuse cache: 0, 0.75, 1.5 reused "
+            "operands per FFMA on sm_86); checks for tools/opcode_energy.py, not in the fit", true},
+        {"broadcast", "banks", ProbeKernel::Banks,
+            {shared, {"SHARED_OP", {SharedLoad}}, {"SHARED_WIDTH", {4, 16}}, {"BANK_WAYS", {1}}, {"SHARED_GROUP", {2, 16, 32}}},
+            {}, options.duties, false,
+            "optional (--only broadcast): ld.shared of 4, 16 B where 2, 16 or 32 lanes read the same address (32 / group "
+            "distinct elements per warp load); checks, not in the fit", true},
+        {"mix", "mix", ProbeKernel::Global,
+            {{"LOAD_OP", {LoadDefault}}, {"FOOTPRINT", {l1, l2, dram}}, {"WIDTH", {4, 16}}, stripes, {"MIX_FFMA", {4, 16}}},
+            {}, options.duties, true,
+            "optional (--only mix): ld of 4, 16 B at L1, L2, DRAM with 4 or 16 FFMAs (three registers) per load: do load "
+            "and FFMA energies add up as the model adds them; checks, not in the fit", true},
+        {"saturate", "saturate", ProbeKernel::Global,
+            {{"LOAD_OP", {LoadDefault}}, {"FOOTPRINT", {l2, dram}}, {"WIDTH", {4, 16}}, stripes, {"MIX_L1", {0, 2, 8}},
+                {"MIX_SHARED", {0, 2, 8}}},
+            [](Values v) { return (v[4] == 0) != (v[5] == 0); }, options.duties, true,
+            "optional (--only saturate): ld of 4, 16 B streaming from L2 or DRAM with 2 or 8 more L1 loads or 16-byte "
+            "shared loads per access: does memory-instruction work cost its price while L2 or DRAM is the bottleneck; "
+            "checks, not in the fit", true},
+        {"tensor", "compute", ProbeKernel::Compute, {{"COMPUTE_OP", tensor}}, {}, options.duties, false,
+            "optional (--only tensor): DMMA f64, sparse HMMA f16 (sm_80+) and FP8 QMMA (sm_89, sm_120); checks of the "
+            "tensor price, not in the fit", true},
     };
 
     std::vector<ProbeGroup> groups;
     std::copy_if(all.cbegin(), all.cend(), std::back_inserter(groups), [&options](const ProbeGroup& group)
     {
-        return options.only.empty() || std::find(options.only.cbegin(), options.only.cend(), group.name) != options.only.cend();
+        const bool named = std::find(options.only.cbegin(), options.only.cend(), group.name) != options.only.cend();
+        return group.parameters.front().second.empty() ? false : named || (options.only.empty() && !group.optional);
     });
+
+    // The groups that number the sectors of the whole grid (GridWalkReachesL2): where their L2 rows would measure L1,
+    // they are left out. FOOTPRINT is these groups' second parameter.
+    if (!GridWalkReachesL2(options, hardware, footprints))
+    {
+        for (ProbeGroup& group : groups)
+        {
+            if (group.kernel == ProbeKernel::Scatter || group.kernel == ProbeKernel::Partial)
+            {
+                const auto allowed = group.allowed;
+                group.allowed = [allowed, l2](Values v) { return v[1] != l2 && (!allowed || allowed(v)); };
+            }
+        }
+    }
+
     return groups;
 }
 
@@ -213,23 +339,15 @@ void DescribeSetup(const Hardware& hardware, const Options& options, const Footp
         warn("the shared probes do not fit " + std::to_string(options.blocksPerSm) + " blocks per SM.");
     }
 
-    // probeScatter and probePartial number the sectors of the whole grid and advance every thread by the sectors of the
-    // grid per step, so at the L2 footprint the data of one SM is the footprint times the blocks per SM, divided by the
-    // largest power of two in the number of blocks: half of it with 82 SMs, but 1/16 with 80 and 1/64 with 64, where it
-    // fits in L1. The counters of a --profile run show it, and the model prices the events that happened.
-    for (const auto& [name, sectorsPerBlock] : {std::pair<std::string, uint64_t>{"locality", options.blockSize * DefaultWidth
-        / SectorBytes}, std::pair<std::string, uint64_t>{"sub-sector", options.blockSize}})
+    // probeScatter and probePartial number the sectors of the whole grid (GridWalkReachesL2).
+    if (!GridWalkReachesL2(options, hardware, footprints))
     {
-        const uint64_t sectors = footprints.l2 / SectorBytes;
-        const uint64_t perSm = blocks == 0 ? footprints.l2 : std::min(footprints.l2, sectors
-            / std::gcd(blocks * sectorsPerBlock, sectors) * sectorsPerBlock * SectorBytes * options.blocksPerSm);
-
-        if (perSm < 4 * hardware.l1Size.value_or(4 * footprints.l1))
-        {
-            warn("with " + std::to_string(blocks) + " blocks the " + name + " probes walk only " + FormatBytes(perSm)
-                + " per SM at the L2 footprint (less than 4x the L1): their L2 rows will mostly hit L1 (check them with "
-                "tools/check_run.py --counters).");
-        }
+        const uint64_t perSm = std::min(GridWalkPerSm(footprints.l2, hardware.multiprocessors, options.blocksPerSm,
+            options.blockSize), GridWalkPerSm(footprints.l2, hardware.multiprocessors, options.blocksPerSm,
+            options.blockSize * DefaultWidth / SectorBytes));
+        warn("with " + std::to_string(blocks) + " blocks the locality, sub-sector and write-path probes walk only "
+            + FormatBytes(perSm) + " per SM at the L2 footprint (less than 4x the L1): their L2 rows would measure L1, so "
+            "they are left out of the plan (ProbePlan.h, GridWalkReachesL2).");
     }
 
     std::cout << "Plan" << (options.randomOrder ? " (the probes of a group in random order)" : "") << ": idle power for "

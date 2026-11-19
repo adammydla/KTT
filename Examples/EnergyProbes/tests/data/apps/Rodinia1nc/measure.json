@@ -1,0 +1,114 @@
+{
+ "device": "NVIDIA GeForce RTX 3090",
+ "pci_bus_id": "0000:82:00.0",
+ "apps": {
+  "lavaMD": {
+   "command": [
+    "/home/xmydla/thesis/third_party/rodinia_build/lavaMD",
+    "-boxes1d",
+    "40"
+   ],
+   "runs": [
+    {
+     "wall_s": 5.218803631141782,
+     "energy_j": 759.5376099504591,
+     "process_j": 543.8856824525968,
+     "after_exit_j": 215.6519274978623,
+     "tail_s": 9.021946953609586,
+     "pre_idle_w": 42.088352713178296,
+     "post_idle_w": 41.84694186046512,
+     "mean_power_w": 145.53864518260974,
+     "temperature_c": 57.47457627118644,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -159.50559504413758,
+     "samples": 413
+    },
+    {
+     "wall_s": 5.218799339607358,
+     "energy_j": 737.2015970763696,
+     "process_j": 557.3293698771239,
+     "after_exit_j": 179.87222719924569,
+     "tail_s": 9.02219945192337,
+     "pre_idle_w": 41.90390347490347,
+     "post_idle_w": 41.88025730994152,
+     "mean_power_w": 141.25885076314003,
+     "temperature_c": 57.21497584541063,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -162.29685759917385,
+     "samples": 414
+    },
+    {
+     "wall_s": 5.216132050380111,
+     "energy_j": 737.8014878915645,
+     "process_j": 546.7719989251073,
+     "after_exit_j": 191.02948896645728,
+     "tail_s": 9.021168369799852,
+     "pre_idle_w": 41.74761003861004,
+     "post_idle_w": 41.715406976744184,
+     "mean_power_w": 141.44609085151504,
+     "temperature_c": 56.76699029126213,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -152.73081148954137,
+     "samples": 412
+    }
+   ]
+  },
+  "needle": {
+   "command": [
+    "/home/xmydla/thesis/third_party/rodinia_build/needle",
+    "16384",
+    "10"
+   ],
+   "runs": [
+    {
+     "wall_s": 2.6329246293753386,
+     "energy_j": 335.63799406105477,
+     "process_j": 230.04978191883896,
+     "after_exit_j": 105.58821214221581,
+     "tail_s": 9.024093005806208,
+     "pre_idle_w": 41.53725968992248,
+     "post_idle_w": 41.37044378698224,
+     "mean_power_w": 127.4772510828329,
+     "temperature_c": 56.770334928229666,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -225.9681403967026,
+     "samples": 209
+    },
+    {
+     "wall_s": 2.6177931148558855,
+     "energy_j": 396.3752641995988,
+     "process_j": 246.41774507888493,
+     "after_exit_j": 149.95751912071387,
+     "tail_s": 9.026070445775986,
+     "pre_idle_w": 41.25219215686274,
+     "post_idle_w": 41.34052325581395,
+     "mean_power_w": 151.41580973308504,
+     "temperature_c": 56.48095238095238,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -235.37830959413128,
+     "samples": 210
+    },
+    {
+     "wall_s": 2.6158376913517714,
+     "energy_j": 415.8348555142834,
+     "process_j": 241.51693117452882,
+     "after_exit_j": 174.31792433975457,
+     "tail_s": 9.024940660223365,
+     "pre_idle_w": 40.90043410852713,
+     "post_idle_w": 40.905912280701756,
+     "mean_power_w": 158.96814121498295,
+     "temperature_c": 55.9,
+     "min_clock_mhz": 1200.0,
+     "max_clock_mhz": 1200.0,
+     "counter_energy_j": -226.09269195009298,
+     "samples": 210
+    }
+   ]
+  }
+ }
+}

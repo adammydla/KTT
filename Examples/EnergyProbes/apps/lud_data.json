@@ -1,0 +1,7 @@
+{
+ "about": "lud on two input matrices of the same size, written by apps/make_inputs.py --lud 16384: the smooth matrix lud -s makes itself, and a random diagonally dominant one. Same kernels and launches, different data values (docs/APPLICATIONS.md). Fewer windows than rodinia.json: every window reads the 3.4 GB text file again (about 45 s).",
+ "apps": [
+  {"name": "lud_smooth", "command": ["lud", "-i", "{inputs}/lud_smooth_16384"], "windows": 6, "window": 6},
+  {"name": "lud_random", "command": ["lud", "-i", "{inputs}/lud_random_16384"], "windows": 6, "window": 6}
+ ]
+}

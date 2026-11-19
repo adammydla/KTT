@@ -23,6 +23,12 @@ struct Hardware
     std::optional<uint64_t> constantL15Size;
     uint32_t computeCapabilityMajor = 0;
     uint32_t computeCapabilityMinor = 0;
+
+    // e.g. 8.6; 0 when unknown (a dry run without a GPU).
+    double ComputeCapability() const
+    {
+        return computeCapabilityMajor + computeCapabilityMinor / 10.0;
+    }
 };
 
 struct Footprints

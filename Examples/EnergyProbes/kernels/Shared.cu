@@ -4,6 +4,7 @@
 //   SMEM_BYTES  bytes of shared memory per block (power of two)
 //   SHARED_OP   0 = ld.shared, 1 = st.shared, 2 = red.shared.add.u32 (32-bit atomic add; probeShared only)
 //   SHARED_WIDTH  probeSharedBanks: bytes per access and thread, 4, 8 or 16
+//   SHARED_GROUP  probeSharedBanks: lanes that read the same address (1 = every lane its own; 2, 16, 32 = broadcast)
 //
 // probeSharedBanks takes the conflict degree as the argument `ways` (the host's parameter BANK_WAYS), so that all degrees
 // run the same SASS: as a compile-time constant, ptxas drops the multiplication for one way.
@@ -16,6 +17,9 @@
 #endif
 #ifndef SHARED_WIDTH
 #define SHARED_WIDTH 4
+#endif
+#ifndef SHARED_GROUP
+#define SHARED_GROUP 1
 #endif
 
 // Shared memory accesses, conflict-free: a warp reads or writes 512 consecutive bytes per instruction.
@@ -133,6 +137,11 @@ extern "C" __global__ void probeShared(u32* __restrict__ sink, u64* __restrict__
 // instructions are the same for every degree. Every iteration moves all threads by BLOCK_SIZE * ways + 1 elements: the
 // data changes and the banks rotate, the conflict degree stays. The host keeps SMEM_BYTES at least 32 * 32 words, so that
 // the elements of a warp instruction are distinct for every degree.
+// Broadcast (SHARED_GROUP > 1, the optional group "broadcast"): SHARED_GROUP consecutive lanes read the same element, so a
+// warp instruction reads 32 / SHARED_GROUP distinct elements, as kernels that take one operand of a product from a row of
+// shared memory (lud_internal: 2 or 16 distinct words per warp load). The wavefronts stay those of the conflict-free
+// access (or fewer, where the distinct bytes fit fewer); Nsight Compute's sm__sass_data_bytes_mem_shared_op_ld counts the
+// distinct bytes only. Only the start index changes; for SHARED_GROUP 1 the SASS is that of the conflict-free probe.
 extern "C" __global__ void probeSharedBanks(u32* __restrict__ sink, u64* __restrict__ counts, const u32 ways,
     const u32 activeSms, const u32 idleRatio, const u32 payloadMask, const u64 durationNs)
 {
@@ -163,7 +172,7 @@ extern "C" __global__ void probeSharedBanks(u32* __restrict__ sink, u64* __restr
     asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(sharedBase) : "l"(words));
 
     const u32 elementMask = mask / (SHARED_WIDTH / 4);
-    u32 index = (threadIdx.x * ways) & elementMask;
+    u32 index = ((threadIdx.x / SHARED_GROUP) * ways) & elementMask;
     const u32 step = BLOCK_SIZE * ways + 1u;
 #if SHARED_OP == 1
     // Stored words: the same recurrence as the other stores, starting from the (random or zero) shared data.

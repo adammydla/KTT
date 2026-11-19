@@ -1,0 +1,13 @@
+{
+ "about": "Rodinia 3.1 CUDA applications for tools/app_energy.py (built by apps/build_rodinia.sh; sizes chosen so that the GPU part matters, plus host- and copy-heavy ones). windows/window: profile that many windows of that many consecutive launches with ncu (spread over the run), the launches in between are interpolated; without them every launch is profiled.",
+ "apps": [
+  {"name": "gaussian", "command": ["gaussian", "-s", "4096", "-q"], "windows": 12, "window": 8},
+  {"name": "lud", "command": ["lud", "-s", "16384"], "windows": 12, "window": 6},
+  {"name": "hotspot", "command": ["hotspot", "2048", "2", "10000", "{inputs}/temp_2048", "{inputs}/power_2048", "{work}/hotspot.out"], "windows": 10, "window": 8},
+  {"name": "particlefilter", "command": ["particlefilter", "-x", "128", "-y", "128", "-z", "20", "-np", "400000"], "windows": 4, "window": 4},
+  {"name": "lavaMD", "command": ["lavaMD", "-boxes1d", "40"]},
+  {"name": "streamcluster", "command": ["streamcluster", "10", "20", "256", "262144", "262144", "1000", "none", "{work}/streamcluster.out", "1"], "windows": 10, "window": 8},
+  {"name": "needle", "command": ["needle", "16384", "10"], "windows": 12, "window": 8},
+  {"name": "pathfinder", "command": ["pathfinder", "400000", "2000", "20"]}
+ ]
+}
